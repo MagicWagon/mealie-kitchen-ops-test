@@ -155,7 +155,19 @@ podman run -it --rm \
 
 The Batch Parser resolves canonical food and unit names, plurals, abbreviations, and existing aliases automatically. If Mealie's parser proposes a catalog item without an ID, KitchenOps leaves that entire recipe unchanged and records the proposal in `logs/parser_pending_catalog.json` instead of sending an invalid update.
 
-On an interactive live run, KitchenOps offers to review the queue after parsing. For each proposed food or unit you can create it, edit and create it, map it to an existing item while adding the proposed term as an alias, map it once without an alias, or defer it. A confirmed bulk action creates all remaining non-conflicting proposals.
+On an interactive live run, KitchenOps offers to review the queue after parsing. Each entry shows the exact food or unit fields that would be submitted, the total recipe-ingredient usage count, up to two recipe usage examples, and the closest existing catalog matches. Choose from the numbered actions:
+
+1. Create the proposed item.
+2. Edit its details, then create it.
+3. Map it to an existing item and permanently save the proposed name as an alias.
+4. Map it to an existing item for this review queue only.
+5. Skip it until a future review session.
+6. Review all eligible proposals and optionally accept them as a batch.
+7. Quit.
+
+After a creation or alias change, KitchenOps refreshes the catalog and removes any other queued proposals that now resolve through the new canonical name, plural, alias, or unit abbreviation. It reports those automatic resolutions before continuing.
+
+The batch review displays every unreviewed proposal before asking for confirmation. Ambiguous items are clearly marked and excluded for individual review, confirmation defaults to No, and a failure on one item does not prevent the remaining eligible items from being processed. The final summary lists created, reused, automatically resolved, excluded, and failed items.
 
 To resume the review later:
 

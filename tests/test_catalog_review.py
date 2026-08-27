@@ -135,7 +135,8 @@ class QueueAndReviewTests(unittest.TestCase):
         self.index = CatalogIndex()
         self.api = FakeApi()
         self.api.refresh(self.index)
-        self.console = Console(file=open(Path(self.temp.name) / "console.txt", "w"))
+        self.console_path = Path(self.temp.name) / "console.txt"
+        self.console = Console(file=open(self.console_path, "w"))
 
     def tearDown(self):
         self.console.file.close()
@@ -189,15 +190,17 @@ class QueueAndReviewTests(unittest.TestCase):
     def test_deferred_entry_remains_queued(self):
         self.queue.upsert_recipe(blocked_record())
         reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
-        with patch("kitchen_ops_catalog.Prompt.ask", return_value="s"):
+        with patch("kitchen_ops_catalog.Prompt.ask", return_value="5") as prompt:
             reviewer.review()
         self.assertEqual(len(self.queue.entries(self.index)), 1)
+        self.assertEqual(prompt.call_args.kwargs["default"], "5")
+        self.assertEqual(prompt.call_args.kwargs["choices"], ["1", "2", "3", "4", "5", "6", "7"])
 
     def test_confirmed_bulk_create_resolves_all_entries(self):
         self.queue.upsert_recipe(blocked_record("one", food="malted cocoa"))
         self.queue.upsert_recipe(blocked_record("two", food="dark cocoa"))
         reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
-        with patch("kitchen_ops_catalog.Prompt.ask", return_value="a"), patch(
+        with patch("kitchen_ops_catalog.Prompt.ask", return_value="6"), patch(
             "kitchen_ops_catalog.Confirm.ask", return_value=True
         ):
             reviewer.review()
@@ -207,12 +210,152 @@ class QueueAndReviewTests(unittest.TestCase):
     def test_review_reports_catalog_action_failure(self):
         self.queue.upsert_recipe(blocked_record())
         reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
-        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["c", "q"]), patch.object(
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["1", "7"]), patch.object(
             reviewer, "create", side_effect=RuntimeError("API unavailable")
         ):
             failures = reviewer.review()
         self.assertEqual(failures, 1)
         self.assertEqual(len(self.queue.entries(self.index)), 1)
+
+    def test_review_shows_submitted_fields_and_only_two_usage_examples(self):
+        for slug in ("one", "two", "three"):
+            record = blocked_record(slug, food="no cook lasagna noodles")
+            record["missing"][0]["proposal"] = {
+                "name": "no cook lasagna noodles",
+                "pluralName": "no cook lasagna noodles",
+                "description": "Oven-ready pasta",
+                "aliases": [{"name": "oven-ready lasagna"}],
+            }
+            self.queue.upsert_recipe(record)
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+        entry = self.queue.entries(self.index)[0]
+
+        reviewer._show_entry(entry, 1, 0)
+        self.console.file.flush()
+        output = self.console_path.read_text()
+
+        self.assertIn("name: 'no cook lasagna noodles'", output)
+        self.assertIn("pluralName: 'no cook lasagna noodles'", output)
+        self.assertIn("description: 'Oven-ready pasta'", output)
+        self.assertIn("aliases: 'oven-ready lasagna'", output)
+        self.assertIn("one: 1 tbsp drinking chocolate", output)
+        self.assertIn("two: 1 tbsp drinking chocolate", output)
+        self.assertNotIn("three: 1 tbsp drinking chocolate", output)
+        self.assertIn("…and 1 more recipe usages", output)
+
+    def test_create_rebuilds_queue_and_resolves_plural_and_alias_entries(self):
+        primary = blocked_record("one", food="alpha noodle")
+        primary["missing"][0]["proposal"] = {
+            "name": "alpha noodle",
+            "pluralName": "alpha noodles",
+            "aliases": [{"name": "alpha ziti"}],
+        }
+        self.queue.upsert_recipe(primary)
+        self.queue.upsert_recipe(blocked_record("two", food="alpha noodles"))
+        self.queue.upsert_recipe(blocked_record("three", food="alpha ziti"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", return_value="1"):
+            reviewer.review()
+
+        self.assertEqual(len(self.api.created), 1)
+        self.assertEqual(self.queue.entries(self.index), [])
+        self.console.file.flush()
+        self.assertIn("Also resolved 2 queued item(s)", self.console_path.read_text())
+
+    def test_numbered_mapping_selection_confirms_and_adds_alias(self):
+        self.queue.upsert_recipe(blocked_record(food="cacao"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["3", "1"]), patch(
+            "kitchen_ops_catalog.Confirm.ask", return_value=True
+        ) as confirm:
+            reviewer.review()
+
+        self.assertIn(("food", "food-cocoa", "cacao"), self.api.aliases)
+        self.assertIn("save the proposed name as an alias", confirm.call_args.args[0])
+        self.assertFalse(confirm.call_args.kwargs["default"])
+
+    def test_mapping_can_search_after_numbered_suggestions(self):
+        self.queue.upsert_recipe(blocked_record(food="cacao"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+        entry = self.queue.entries(self.index)[0]
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["3", "sugar", "1"]):
+            selected = reviewer.choose_mapping(entry)
+
+        self.assertEqual(selected["id"], "food-sugar")
+
+    def test_bulk_cancel_changes_nothing(self):
+        self.queue.upsert_recipe(blocked_record(food="malted cocoa"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["6", "7"]), patch(
+            "kitchen_ops_catalog.Confirm.ask", return_value=False
+        ):
+            reviewer.review()
+
+        self.assertEqual(self.api.created, [])
+        self.assertEqual(len(self.queue.entries(self.index)), 1)
+
+    def test_bulk_excludes_ambiguous_entries(self):
+        eligible = blocked_record("one", food="malted cocoa")
+        ambiguous = blocked_record("two", food="mystery cocoa")
+        ambiguous["missing"][0]["ambiguous"] = True
+        self.queue.upsert_recipe(eligible)
+        self.queue.upsert_recipe(ambiguous)
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["6", "7"]), patch(
+            "kitchen_ops_catalog.Confirm.ask", return_value=True
+        ):
+            reviewer.review()
+
+        self.assertEqual([item[1]["name"] for item in self.api.created], ["malted cocoa"])
+        remaining = self.queue.entries(self.index)
+        self.assertEqual([entry["name"] for entry in remaining], ["mystery cocoa"])
+
+    def test_bulk_continues_after_an_item_failure(self):
+        self.queue.upsert_recipe(blocked_record("one", food="dark cocoa"))
+        self.queue.upsert_recipe(blocked_record("two", food="malted cocoa"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+        real_create = reviewer.create
+
+        def create_with_failure(entry, proposal=None):
+            if entry["name"] == "dark cocoa":
+                raise RuntimeError("API unavailable")
+            return real_create(entry, proposal)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["6", "7"]), patch(
+            "kitchen_ops_catalog.Confirm.ask", return_value=True
+        ), patch.object(reviewer, "create", side_effect=create_with_failure):
+            failures = reviewer.review()
+
+        self.assertEqual(failures, 1)
+        self.assertEqual([item[1]["name"] for item in self.api.created], ["malted cocoa"])
+        self.assertEqual(
+            [entry["name"] for entry in self.queue.entries(self.index)], ["dark cocoa"]
+        )
+
+    def test_bulk_revalidates_entries_resolved_earlier_in_the_batch(self):
+        primary = blocked_record("one", food="alpha noodle")
+        primary["missing"][0]["proposal"] = {
+            "name": "alpha noodle",
+            "pluralName": "alpha noodles",
+        }
+        self.queue.upsert_recipe(primary)
+        self.queue.upsert_recipe(blocked_record("two", food="alpha noodles"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", return_value="6"), patch(
+            "kitchen_ops_catalog.Confirm.ask", return_value=True
+        ):
+            reviewer.review()
+
+        self.assertEqual([item[1]["name"] for item in self.api.created], ["alpha noodle"])
+        self.assertEqual(self.queue.entries(self.index), [])
+        self.console.file.flush()
+        self.assertIn("Automatically resolved (1)", self.console_path.read_text())
 
     def test_corrupt_queue_is_preserved(self):
         self.path.write_text("not json", encoding="utf-8")

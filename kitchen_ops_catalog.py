@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Optional
 
 import requests
 from rich.console import Console
+from rich.markup import escape
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
@@ -441,21 +442,32 @@ class CatalogReviewer:
         return current
 
     def choose_mapping(self, entry: dict[str, Any]) -> Optional[dict[str, Any]]:
-        suggestions = self.index.search(entry["kind"], entry["name"], limit=5)
-        if suggestions:
-            self._candidate_table(suggestions)
-        query = Prompt.ask("Search catalog", default=entry["name"], console=self.console)
-        candidates = self.index.search(entry["kind"], query, limit=10)
-        if not candidates:
-            self.console.print("[warning]No catalog matches found.[/warning]")
-            return None
-        self._candidate_table(candidates)
-        choice = Prompt.ask(
-            f"Select 1-{len(candidates)} (blank to cancel)", default="", console=self.console
-        ).strip()
-        if not choice.isdigit() or not 1 <= int(choice) <= len(candidates):
-            return None
-        return candidates[int(choice) - 1]
+        candidates = self.index.search(entry["kind"], entry["name"], limit=5)
+        search_label = "Search catalog"
+        while True:
+            if candidates:
+                self._candidate_table(candidates)
+            search_choice = len(candidates) + 1
+            cancel_choice = len(candidates) + 2
+            self.console.print(f"{search_choice}) {search_label}", markup=False)
+            self.console.print(f"{cancel_choice}) Cancel", markup=False)
+            choice = Prompt.ask(
+                "Choose an existing item",
+                choices=[str(number) for number in range(1, cancel_choice + 1)],
+                default=str(cancel_choice),
+                console=self.console,
+            )
+            selected = int(choice)
+            if selected <= len(candidates):
+                return candidates[selected - 1]
+            if selected == cancel_choice:
+                return None
+
+            query = Prompt.ask("Search catalog", default=entry["name"], console=self.console)
+            candidates = self.index.search(entry["kind"], query, limit=10)
+            search_label = "Search again"
+            if not candidates:
+                self.console.print("[warning]No catalog matches found.[/warning]")
 
     def _candidate_table(self, candidates: list[dict[str, Any]]) -> None:
         table = Table(title="Catalog candidates")
@@ -466,21 +478,204 @@ class CatalogReviewer:
             table.add_row(str(index), item["name"], ", ".join(_aliases(item)[:4]))
         self.console.print(table)
 
-    def _show_entry(self, entry: dict[str, Any], number: int, total: int) -> None:
-        proposal = entry["proposal"]
-        self.console.rule(f"[bold cyan]{entry['kind'].title()} {number}/{total}: {entry['name']}[/bold cyan]")
+    @staticmethod
+    def _display_value(value: Any) -> str:
+        if isinstance(value, list):
+            values = [
+                item.get("name") if isinstance(item, dict) else item
+                for item in value
+            ]
+            return ", ".join(repr(item) for item in values if item not in (None, ""))
+        return repr(value)
+
+    @classmethod
+    def _proposal_fields(cls, entry: dict[str, Any]) -> list[tuple[str, str]]:
+        proposal = entry.get("proposal") or {}
+        proposed_name = proposal.get("name") or entry.get("name")
+        fields: list[tuple[str, str]] = [("name", cls._display_value(proposed_name))]
+        for field, value in proposal.items():
+            if field == "name" or value is None or value == "" or value == [] or value == {}:
+                continue
+            fields.append((field, cls._display_value(value)))
+        return fields
+
+    @staticmethod
+    def _usage_examples(entry: dict[str, Any]) -> list[str]:
+        occurrences = entry.get("occurrences") or []
+        examples = [
+            f"{occurrence['slug']}: {occurrence['raw']}" for occurrence in occurrences[:2]
+        ]
+        if len(occurrences) > 2:
+            examples.append(f"…and {len(occurrences) - 2} more recipe usages")
+        return examples
+
+    def _show_entry(self, entry: dict[str, Any], remaining: int, skipped: int) -> None:
+        self.console.rule(
+            f"[bold cyan]{entry['kind'].title()}: {escape(str(entry['name']))}[/bold cyan]"
+        )
+        status = f"{remaining} unresolved item(s) remain"
+        if skipped:
+            status += f"; {skipped} skipped this session"
+        self.console.print(status, markup=False)
+        self.console.print(f"Create would submit this {entry['kind']}:", style="bold")
+        for field, value in self._proposal_fields(entry):
+            self.console.print(f"  {field}: {value}", markup=False)
         self.console.print(
             f"Used by [cyan]{len(entry['occurrences'])}[/cyan] recipe ingredient(s)"
         )
-        fields = ["pluralName", "abbreviation", "pluralAbbreviation"]
-        details = [f"{field}={proposal[field]!r}" for field in fields if proposal.get(field)]
-        if details:
-            self.console.print("Proposal: " + ", ".join(details))
-        for occurrence in entry["occurrences"][:3]:
-            self.console.print(f"  • {occurrence['slug']}: {occurrence['raw']}")
+        for example in self._usage_examples(entry):
+            self.console.print(f"  • {example}", markup=False)
+        if entry.get("ambiguous"):
+            self.console.print(
+                "[warning]Manual review required: this name has ambiguous catalog matches.[/warning]"
+            )
         suggestions = self.index.search(entry["kind"], entry["name"], limit=5)
         if suggestions:
-            self.console.print("Closest existing: " + ", ".join(item["name"] for item in suggestions))
+            self.console.print(
+                "Closest existing: " + ", ".join(item["name"] for item in suggestions),
+                markup=False,
+            )
+
+    def _show_actions(self) -> None:
+        self.console.print("1) Create the proposed item", markup=False)
+        self.console.print("2) Edit details, then create", markup=False)
+        self.console.print("3) Map to an existing item and save an alias", markup=False)
+        self.console.print("4) Map to an existing item for this review queue only", markup=False)
+        self.console.print("5) Skip for now", markup=False)
+        self.console.print(
+            "6) Review all eligible proposals, then optionally accept all", markup=False
+        )
+        self.console.print("7) Quit", markup=False)
+
+    def _report_reconciliation(
+        self, before: list[dict[str, Any]], primary_key: Optional[str] = None
+    ) -> None:
+        after = self.queue.entries(self.index)
+        after_keys = {entry["key"] for entry in after}
+        reconciled: list[str] = []
+        for entry in before:
+            if entry["key"] == primary_key or entry["key"] in after_keys:
+                continue
+            item, ambiguous = self.queue.resolution(entry["kind"], entry["name"], self.index)
+            target = item["name"] if item and not ambiguous else "an existing catalog item"
+            reconciled.append(f"{entry['name']!r} → {target!r}")
+        if reconciled:
+            self.console.print(
+                f"Also resolved {len(reconciled)} queued item(s): " + ", ".join(reconciled),
+                markup=False,
+            )
+        self.console.print(f"{len(after)} unresolved item(s) remain in the queue.", markup=False)
+
+    def _bulk_table(self, entries: list[dict[str, Any]]) -> None:
+        table = Table(title="Review proposed catalog items")
+        table.add_column("Type")
+        table.add_column("Proposed item")
+        table.add_column("Other submitted fields")
+        table.add_column("Usages", justify="right")
+        table.add_column("Recipe usage examples")
+        table.add_column("Closest existing")
+        table.add_column("Status")
+        for entry in entries:
+            fields = self._proposal_fields(entry)
+            details = ", ".join(f"{field}={value}" for field, value in fields if field != "name")
+            suggestions = self.index.search(entry["kind"], entry["name"], limit=5)
+            if entry.get("ambiguous"):
+                status = "Manual review required"
+            elif not entry.get("name"):
+                status = "Missing proposed name"
+            else:
+                status = "Eligible"
+            table.add_row(
+                entry["kind"],
+                escape(str((entry.get("proposal") or {}).get("name") or entry.get("name") or "")),
+                escape(details) or "—",
+                str(len(entry.get("occurrences") or [])),
+                escape("\n".join(self._usage_examples(entry))),
+                escape(", ".join(item["name"] for item in suggestions)) or "—",
+                status,
+            )
+        self.console.print(table)
+
+    @staticmethod
+    def _unique(values: list[str]) -> list[str]:
+        return list(dict.fromkeys(values))
+
+    def _bulk_summary(self, label: str, values: list[str]) -> None:
+        values = self._unique(values)
+        if values:
+            self.console.print(f"{label} ({len(values)}): " + ", ".join(values), markup=False)
+
+    def _review_bulk(self, deferred: set[str]) -> int:
+        self.refresh()
+        entries = [
+            entry for entry in self.queue.entries(self.index) if entry["key"] not in deferred
+        ]
+        if not entries:
+            self.console.print("No unreviewed proposals remain in this session.")
+            return 0
+        self._bulk_table(entries)
+        eligible = [
+            entry for entry in entries if entry.get("name") and not entry.get("ambiguous")
+        ]
+        initially_excluded = [entry for entry in entries if entry not in eligible]
+        if not eligible:
+            self.console.print(
+                "[warning]No proposals are eligible for bulk creation; review them individually.[/warning]"
+            )
+            return 0
+        if not Confirm.ask(
+            f"Accept and create {len(eligible)} eligible proposed item(s)? "
+            f"{len(initially_excluded)} item(s) will be excluded. Similar existing items may cause duplicates.",
+            default=False,
+            console=self.console,
+        ):
+            self.console.print("Bulk creation cancelled; no proposed items were changed.")
+            return 0
+
+        created: list[str] = []
+        reused: list[str] = []
+        auto_resolved: list[str] = []
+        excluded: list[str] = []
+        failed: list[str] = []
+        for entry in eligible:
+            try:
+                self.refresh(entry["kind"])
+                resolved, ambiguous = self.queue.resolution(
+                    entry["kind"], entry["name"], self.index
+                )
+                if resolved and not ambiguous:
+                    auto_resolved.append(f"{entry['name']!r} → {resolved['name']!r}")
+                    continue
+                proposal_name = (entry.get("proposal") or {}).get("name") or entry["name"]
+                existing, proposal_ambiguous = self.index.resolve(entry["kind"], proposal_name)
+                if proposal_ambiguous:
+                    excluded.append(entry["name"])
+                    continue
+                item = self.create(entry)
+                if existing:
+                    reused.append(f"{entry['name']!r} → {item['name']!r}")
+                else:
+                    created.append(item["name"])
+            except Exception as exc:
+                failed.append(f"{entry['name']!r}: {exc}")
+
+        for entry in initially_excluded:
+            resolved, ambiguous = self.queue.resolution(entry["kind"], entry["name"], self.index)
+            if resolved and not ambiguous:
+                auto_resolved.append(f"{entry['name']!r} → {resolved['name']!r}")
+            else:
+                excluded.append(entry["name"] or "<missing name>")
+
+        self._bulk_summary("Created", created)
+        self._bulk_summary("Reused existing catalog items", reused)
+        self._bulk_summary("Automatically resolved", auto_resolved)
+        self._bulk_summary("Excluded for manual review", excluded)
+        self._bulk_summary("Failed and left queued", failed)
+        self.console.print(
+            f"{len(self.queue.entries(self.index))} unresolved item(s) remain in the queue.",
+            markup=False,
+        )
+        return len(failed)
 
     def _edit_proposal(self, entry: dict[str, Any]) -> dict[str, Any]:
         proposal = copy.deepcopy(entry["proposal"])
@@ -500,56 +695,63 @@ class CatalogReviewer:
         return proposal
 
     def review(self) -> int:
-        entries = self.queue.entries(self.index)
-        total = len(entries)
-        if not entries:
+        if not self.queue.entries(self.index):
             self.console.print("[success]No unresolved catalog items.[/success]")
             return 0
-        position = 0
+        deferred: set[str] = set()
         failures = 0
-        while position < len(entries):
-            entry = entries[position]
-            self._show_entry(entry, position + 1, total)
+        while True:
+            entries = self.queue.entries(self.index)
+            deferred.intersection_update(entry["key"] for entry in entries)
+            active = [entry for entry in entries if entry["key"] not in deferred]
+            if not active:
+                if entries:
+                    self.console.print(
+                        f"Review complete for this session; {len(entries)} skipped item(s) remain queued.",
+                        markup=False,
+                    )
+                break
+            entry = active[0]
+            self._show_entry(entry, len(entries), len(deferred))
+            self._show_actions()
             action = Prompt.ask(
-                "[c]reate, [e]dit/create, [m]ap+alias, [o]ne-time map, "
-                "[s]kip, create [a]ll, [q]uit",
-                choices=["c", "e", "m", "o", "s", "a", "q"],
-                default="s",
+                "Choose an action",
+                choices=["1", "2", "3", "4", "5", "6", "7"],
+                default="5",
                 console=self.console,
             )
             try:
-                if action == "q":
+                if action == "7":
                     break
-                if action == "s":
-                    position += 1
+                if action == "5":
+                    deferred.add(entry["key"])
                     continue
-                if action == "c":
+                if action == "1":
                     created = self.create(entry)
                     self.console.print(f"[success]Resolved as {created['name']}.[/success]")
-                elif action == "e":
+                    self._report_reconciliation(entries, entry["key"])
+                elif action == "2":
                     created = self.create(entry, self._edit_proposal(entry))
                     self.console.print(f"[success]Resolved as {created['name']}.[/success]")
-                elif action in ("m", "o"):
+                    self._report_reconciliation(entries, entry["key"])
+                elif action in ("3", "4"):
                     selected = self.choose_mapping(entry)
                     if not selected:
                         continue
-                    mapped = self.map(entry, selected, add_alias=action == "m")
-                    suffix = " and added alias" if action == "m" else " for this queue only"
-                    self.console.print(f"[success]Mapped to {mapped['name']}{suffix}.[/success]")
-                elif action == "a":
-                    remaining = entries[position:]
-                    safe = [item for item in remaining if not item.get("ambiguous") and item.get("name")]
-                    if Confirm.ask(
-                        f"Create {len(safe)} remaining non-conflicting catalog items?",
+                    if action == "3" and not Confirm.ask(
+                        f"Map {escape(repr(entry['name']))} to {escape(repr(selected['name']))} "
+                        "and save the proposed name as an alias?",
                         default=False,
                         console=self.console,
                     ):
-                        for bulk_entry in safe:
-                            self.create(bulk_entry)
-                        self.console.print(f"[success]Created/resolved {len(safe)} catalog items.[/success]")
-                        break
-                    continue
-                position += 1
+                        self.console.print("Alias mapping cancelled; no catalog item was changed.")
+                        continue
+                    mapped = self.map(entry, selected, add_alias=action == "3")
+                    suffix = " and added alias" if action == "3" else " for this queue only"
+                    self.console.print(f"[success]Mapped to {mapped['name']}{suffix}.[/success]")
+                    self._report_reconciliation(entries, entry["key"])
+                elif action == "6":
+                    failures += self._review_bulk(deferred)
             except Exception as exc:
                 failures += 1
                 self.console.print(f"[error]Catalog action failed: {exc}[/error]")
@@ -565,6 +767,8 @@ def pending_summary(console: Console, queue: PendingCatalogQueue, index: Catalog
     table.add_column("Occurrences", justify="right")
     table.add_column("Examples")
     for entry in entries:
-        examples = ", ".join(item["slug"] for item in entry["occurrences"][:3])
+        examples = ", ".join(item["slug"] for item in entry["occurrences"][:2])
+        if len(entry["occurrences"]) > 2:
+            examples += f", …and {len(entry['occurrences']) - 2} more"
         table.add_row(entry["kind"], entry["name"] or "<missing name>", str(len(entry["occurrences"])), examples)
     console.print(table)
