@@ -1,7 +1,7 @@
 """KitchenOps Batch Parser — fixes unparsed recipe ingredients via Mealie's NLP API."""
 
 import argparse
-import concurrent.futures, copy, json, logging, os, signal, sys, threading, time
+import concurrent.futures, copy, json, logging, os, re, signal, sys, threading, time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
@@ -233,6 +233,23 @@ def _raw_text(item: Any) -> str:
     return str(item or "")
 
 
+_PARSER_FRACTION_PLACEHOLDER = re.compile(r"#(\d+)\$(\d+)")
+
+
+def _restore_parser_fraction_placeholders(value: Any) -> Any:
+    """Restore fraction tokens that occasionally leak from ingredient-parser output."""
+    if isinstance(value, str):
+        return _PARSER_FRACTION_PLACEHOLDER.sub(r"\1/\2", value)
+    if isinstance(value, list):
+        return [_restore_parser_fraction_placeholders(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _restore_parser_fraction_placeholders(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 def _resolve_catalog_reference(
     kind: str,
     target: dict[str, Any],
@@ -383,7 +400,9 @@ def process_recipe(slug: str) -> ProcessResult:
         if item is None:
             final_list.append(raw_ingredients[i])
         else:
-            target = copy.deepcopy(item.get("ingredient", item))
+            target = _restore_parser_fraction_placeholders(
+                copy.deepcopy(item.get("ingredient", item))
+            )
             for bad_key in ("referenceId", "id", "recipeId", "stepId", "labelId"):
                 target.pop(bad_key, None)
             _resolve_catalog_reference("food", target, i, raw_ingredients[i], missing)

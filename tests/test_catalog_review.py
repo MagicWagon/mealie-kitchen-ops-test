@@ -1,6 +1,8 @@
 import copy
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,9 +12,11 @@ from rich.console import Console
 import kitchen_ops_parser as parser
 from kitchen_ops_catalog import (
     CatalogApi,
+    CatalogActionJournal,
     CatalogIndex,
     CatalogReviewer,
     PendingCatalogQueue,
+    QueueCheckpointWriter,
     replay_ready_recipes,
 )
 
@@ -126,6 +130,42 @@ class CatalogIndexTests(unittest.TestCase):
         self.assertIsNone(item)
         self.assertTrue(ambiguous)
 
+    def test_incremental_upsert_updates_resolution_and_search(self):
+        index = CatalogIndex()
+        index.replace("food", FOODS)
+        updated = copy.deepcopy(FOODS[0])
+        updated["aliases"].append({"name": "cacao"})
+
+        index.upsert("food", updated)
+
+        self.assertEqual(index.resolve("food", "cacao")[0]["id"], "food-cocoa")
+        self.assertEqual(index.search("food", "cacao", 1)[0]["id"], "food-cocoa")
+
+    def test_rapid_search_meets_large_catalog_budget(self):
+        index = CatalogIndex()
+        index.replace(
+            "food",
+            (
+                {
+                    "id": str(number),
+                    "name": f"ingredient {number}",
+                    "pluralName": f"ingredients {number}",
+                    "aliases": [],
+                }
+                for number in range(10_000)
+            ),
+        )
+
+        started = time.perf_counter()
+        index.search("food", "no cook lasagna noodles", 5)
+        uncached = time.perf_counter() - started
+        started = time.perf_counter()
+        index.search("food", "no cook lasagna noodles", 5)
+        cached = time.perf_counter() - started
+
+        self.assertLess(uncached, 0.1)
+        self.assertLess(cached, 0.05)
+
 
 class QueueAndReviewTests(unittest.TestCase):
     def setUp(self):
@@ -211,7 +251,7 @@ class QueueAndReviewTests(unittest.TestCase):
         self.queue.upsert_recipe(blocked_record())
         reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
         with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["1", "7"]), patch.object(
-            reviewer, "create", side_effect=RuntimeError("API unavailable")
+            self.api, "create_item", side_effect=RuntimeError("API unavailable")
         ):
             failures = reviewer.review()
         self.assertEqual(failures, 1)
@@ -319,16 +359,16 @@ class QueueAndReviewTests(unittest.TestCase):
         self.queue.upsert_recipe(blocked_record("one", food="dark cocoa"))
         self.queue.upsert_recipe(blocked_record("two", food="malted cocoa"))
         reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
-        real_create = reviewer.create
+        real_create = self.api.create_item
 
-        def create_with_failure(entry, proposal=None):
-            if entry["name"] == "dark cocoa":
+        def create_with_failure(kind, proposal):
+            if proposal["name"] == "dark cocoa":
                 raise RuntimeError("API unavailable")
-            return real_create(entry, proposal)
+            return real_create(kind, proposal)
 
         with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["6", "7"]), patch(
             "kitchen_ops_catalog.Confirm.ask", return_value=True
-        ), patch.object(reviewer, "create", side_effect=create_with_failure):
+        ), patch.object(self.api, "create_item", side_effect=create_with_failure):
             failures = reviewer.review()
 
         self.assertEqual(failures, 1)
@@ -355,7 +395,107 @@ class QueueAndReviewTests(unittest.TestCase):
         self.assertEqual([item[1]["name"] for item in self.api.created], ["alpha noodle"])
         self.assertEqual(self.queue.entries(self.index), [])
         self.console.file.flush()
-        self.assertIn("Automatically resolved (1)", self.console_path.read_text())
+        self.assertIn("Also resolved 1 queued item(s)", self.console_path.read_text())
+
+    def test_review_advances_while_create_is_still_running(self):
+        self.queue.upsert_recipe(blocked_record("one", food="alpha food"))
+        self.queue.upsert_recipe(blocked_record("two", food="beta food"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+        api_started = threading.Event()
+        release_api = threading.Event()
+        real_create = self.api.create_item
+        action_times = []
+
+        def delayed_create(kind, proposal):
+            api_started.set()
+            release_api.wait(timeout=2)
+            return real_create(kind, proposal)
+
+        def prompt(question, **kwargs):
+            if question != "Choose an action":
+                raise AssertionError(f"Unexpected prompt: {question}")
+            action_times.append(time.perf_counter())
+            if len(action_times) == 1:
+                return "1"
+            self.assertTrue(api_started.wait(timeout=1))
+            release_api.set()
+            return "7"
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=prompt), patch.object(
+            self.api, "create_item", side_effect=delayed_create
+        ):
+            reviewer.review()
+
+        self.assertEqual(len(action_times), 2)
+        self.assertLess(action_times[1] - action_times[0], 0.15)
+        self.assertEqual([item[1]["name"] for item in self.api.created], ["alpha food"])
+
+    def test_background_catalog_writes_are_serial(self):
+        for slug, food in (("one", "alpha food"), ("two", "beta food"), ("three", "gamma food")):
+            self.queue.upsert_recipe(blocked_record(slug, food=food))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+        real_create = self.api.create_item
+        active = 0
+        maximum_active = 0
+        lock = threading.Lock()
+
+        def tracked_create(kind, proposal):
+            nonlocal active, maximum_active
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.03)
+            try:
+                return real_create(kind, proposal)
+            finally:
+                with lock:
+                    active -= 1
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["1", "1", "7"]), patch.object(
+            self.api, "create_item", side_effect=tracked_create
+        ):
+            reviewer.review()
+
+        self.assertEqual(maximum_active, 1)
+        self.assertEqual(
+            [item[1]["name"] for item in self.api.created], ["alpha food", "beta food"]
+        )
+
+    def test_failed_create_restores_related_reserved_entries(self):
+        primary = blocked_record("one", food="alpha noodle")
+        primary["missing"][0]["proposal"] = {
+            "name": "alpha noodle",
+            "pluralName": "alpha noodles",
+        }
+        self.queue.upsert_recipe(primary)
+        self.queue.upsert_recipe(blocked_record("two", food="alpha noodles"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["1", "7"]), patch.object(
+            self.api, "create_item", side_effect=RuntimeError("API unavailable")
+        ):
+            failures = reviewer.review()
+
+        self.assertEqual(failures, 1)
+        self.assertEqual(
+            [entry["name"] for entry in self.queue.entries(self.index)],
+            ["alpha noodle", "alpha noodles"],
+        )
+        self.console.file.flush()
+        output = self.console_path.read_text()
+        self.assertIn("failed and returned to review", output)
+        self.assertIn("Previous action failed: API unavailable", output)
+
+    def test_review_actions_do_not_refresh_the_full_catalog(self):
+        self.queue.upsert_recipe(blocked_record(food="new cocoa"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch.object(self.api, "refresh", wraps=self.api.refresh) as refresh, patch(
+            "kitchen_ops_catalog.Prompt.ask", return_value="1"
+        ):
+            reviewer.review()
+
+        refresh.assert_not_called()
 
     def test_corrupt_queue_is_preserved(self):
         self.path.write_text("not json", encoding="utf-8")
@@ -363,6 +503,140 @@ class QueueAndReviewTests(unittest.TestCase):
         self.assertIsNotNone(loaded.corrupt_backup)
         self.assertTrue(loaded.corrupt_backup.exists())
         self.assertFalse(self.path.exists())
+
+
+class CatalogJournalTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / "pending.json"
+        self.queue = PendingCatalogQueue(self.path)
+        self.queue.upsert_recipe(blocked_record(food="original phrase"))
+        self.queue.save()
+        self.index = CatalogIndex()
+        self.index.replace("food", FOODS)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def submit_create(self, journal):
+        return journal.append(
+            "submitted",
+            actionId="action-one",
+            operation="create",
+            kind="food",
+            sourceName="original phrase",
+            reservedKeys=["food:original phrase"],
+            proposal={"name": "created food"},
+            targetItem=None,
+        )
+
+    def test_completed_action_replays_after_crash(self):
+        journal = CatalogActionJournal(self.path)
+        self.submit_create(journal)
+        item = {"id": "food-created", "name": "created food", "aliases": []}
+        journal.append("completed", actionId="action-one", item=item)
+        loaded = PendingCatalogQueue(self.path).load()
+
+        errors = journal.recover(loaded, self.index)
+
+        self.assertEqual(errors, {})
+        self.assertEqual(
+            loaded.resolution("food", "original phrase", self.index)[0]["id"],
+            "food-created",
+        )
+        self.assertFalse(journal.path.exists())
+
+    def test_uncertain_create_is_reconciled_from_catalog(self):
+        journal = CatalogActionJournal(self.path)
+        self.submit_create(journal)
+        item = {"id": "food-created", "name": "created food", "aliases": []}
+        self.index.upsert("food", item)
+        loaded = PendingCatalogQueue(self.path).load()
+
+        errors = journal.recover(loaded, self.index)
+
+        self.assertEqual(errors, {})
+        self.assertEqual(
+            loaded.resolution("food", "original phrase", self.index)[0]["id"],
+            "food-created",
+        )
+
+    def test_failed_action_returns_recovery_error(self):
+        journal = CatalogActionJournal(self.path)
+        self.submit_create(journal)
+        journal.append("failed", actionId="action-one", error="API unavailable")
+        loaded = PendingCatalogQueue(self.path).load()
+
+        errors = journal.recover(loaded, self.index)
+
+        self.assertEqual(errors["food:original phrase"], "API unavailable")
+
+    def test_uncertain_alias_is_reconciled_from_target_item(self):
+        target = copy.deepcopy(FOODS[0])
+        target["aliases"].append({"name": "original phrase"})
+        self.index.upsert("food", target)
+        journal = CatalogActionJournal(self.path)
+        journal.append(
+            "submitted",
+            actionId="alias-action",
+            operation="map_alias",
+            kind="food",
+            sourceName="original phrase",
+            reservedKeys=["food:original phrase"],
+            proposal=None,
+            targetItem=target,
+        )
+        loaded = PendingCatalogQueue(self.path).load()
+
+        errors = journal.recover(loaded, self.index)
+
+        self.assertEqual(errors, {})
+        self.assertEqual(
+            loaded.resolution("food", "original phrase", self.index)[0]["id"],
+            "food-cocoa",
+        )
+
+    def test_truncated_final_journal_record_is_ignored_and_repaired(self):
+        journal = CatalogActionJournal(self.path)
+        self.submit_create(journal)
+        with journal.path.open("a", encoding="utf-8") as handle:
+            handle.write('{"sequence": 2, "status":')
+
+        records = journal.records()
+
+        self.assertEqual(len(records), 1)
+        repaired_lines = journal.path.read_text().splitlines()
+        self.assertEqual(len(repaired_lines), 1)
+        self.assertEqual(json.loads(repaired_lines[0])["status"], "submitted")
+
+    def test_sequence_continues_after_checkpoint_compaction(self):
+        self.queue.data["checkpointSequence"] = 5
+        self.queue.save()
+        journal = CatalogActionJournal(self.path, checkpoint_sequence=5)
+
+        record = journal.append("failed", actionId="new-action", error="failure")
+
+        self.assertEqual(record["sequence"], 6)
+
+    def test_checkpoint_keeps_records_appended_after_its_snapshot(self):
+        journal = CatalogActionJournal(self.path)
+        self.submit_create(journal)
+        item = {"id": "food-created", "name": "created food", "aliases": []}
+        journal.append("completed", actionId="action-one", item=item)
+        self.queue.set_resolution("food", "original phrase", item)
+        writer = QueueCheckpointWriter(self.queue, journal)
+        writer.completed_since_checkpoint = 19
+
+        writer.note_completion()
+        newer = journal.append("failed", actionId="newer-action", error="later failure")
+        for future in writer.futures:
+            future.result()
+        remaining = journal.records()
+        writer.executor.shutdown(wait=True)
+
+        self.assertEqual([record["sequence"] for record in remaining], [newer["sequence"]])
+        checkpointed = PendingCatalogQueue(self.path).load()
+        self.assertEqual(checkpointed.data["checkpointSequence"], 2)
 
 
 class ReplayTests(unittest.TestCase):
@@ -529,6 +803,39 @@ class ParserSafetyTests(unittest.TestCase):
 
         self.assertEqual(result.status, "dry_run")
         self.assertEqual(session.puts, [])
+
+    def test_fraction_placeholder_is_restored_before_catalog_review(self):
+        recipe = {
+            "slug": "grilled-flat-iron-steak-fajitas",
+            "recipeIngredient": ['3/4" Thick Flat Iron Steaks'],
+        }
+        parsed = [
+            {
+                "confidence": {"average": 1.0},
+                "ingredient": {
+                    "quantity": 1,
+                    "food": {"name": '#3$4" Thick Flat Iron Steaks'},
+                    "note": "",
+                },
+            }
+        ]
+        session = FakeParserSession(recipe, parsed)
+        empty_index = CatalogIndex()
+        empty_index.replace("food", [])
+        empty_index.replace("unit", [])
+
+        with patch.object(parser, "get_session", return_value=session), patch.object(
+            parser, "CATALOG_INDEX", empty_index
+        ), patch.object(parser, "DRY_RUN", False):
+            result = parser.process_recipe("grilled-flat-iron-steak-fajitas")
+
+        self.assertEqual(result.status, "blocked")
+        missing = result.blocked_record["missing"][0]
+        self.assertEqual(missing["name"], '3/4" Thick Flat Iron Steaks')
+        self.assertEqual(
+            result.blocked_record["proposedIngredients"][0]["food"]["name"],
+            '3/4" Thick Flat Iron Steaks',
+        )
 
 
 if __name__ == "__main__":

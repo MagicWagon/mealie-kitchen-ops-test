@@ -155,6 +155,8 @@ podman run -it --rm \
 
 The Batch Parser resolves canonical food and unit names, plurals, abbreviations, and existing aliases automatically. If Mealie's parser proposes a catalog item without an ID, KitchenOps leaves that entire recipe unchanged and records the proposal in `logs/parser_pending_catalog.json` instead of sending an invalid update.
 
+KitchenOps also restores leaked ingredient-parser fraction placeholders such as `#3$4` back to `3/4` before displaying or saving a proposal.
+
 On an interactive live run, KitchenOps offers to review the queue after parsing. Each entry shows the exact food or unit fields that would be submitted, the total recipe-ingredient usage count, up to two recipe usage examples, and the closest existing catalog matches. Choose from the numbered actions:
 
 1. Create the proposed item.
@@ -165,7 +167,11 @@ On an interactive live run, KitchenOps offers to review the queue after parsing.
 6. Review all eligible proposals and optionally accept them as a batch.
 7. Quit.
 
-After a creation or alias change, KitchenOps refreshes the catalog and removes any other queued proposals that now resolve through the new canonical name, plural, alias, or unit abbreviation. It reports those automatic resolutions before continuing.
+Create and alias actions run in submission order on a background worker, so the next review item appears immediately instead of waiting for a full Mealie catalog refresh. The status line shows how many actions are pending. Names, plurals, aliases, and unit abbreviations affected by a pending creation are temporarily reserved so they are not reviewed twice.
+
+Completed actions update the in-memory catalog directly and report any related proposals that were resolved automatically. A failed action and its related reservations return to the review list with the error visible. KitchenOps records submitted and completed decisions in `logs/parser_pending_catalog.json.journal` and checkpoints the main queue in the background, preserving decisions if the process is interrupted.
+
+Choosing Quit stops new decisions but waits for submitted catalog actions to finish and saves a final queue checkpoint before recipe updates begin.
 
 The batch review displays every unreviewed proposal before asking for confirmation. Ambiguous items are clearly marked and excluded for individual review, confirmation defaults to No, and a failure on one item does not prevent the remaining eligible items from being processed. The final summary lists created, reused, automatically resolved, excluded, and failed items.
 
