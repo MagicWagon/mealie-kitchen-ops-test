@@ -9,6 +9,7 @@ KitchenOps is a production-ready suite of maintenance tools for [Mealie](https:/
 *   **Data-Driven Architecture**: All tagging rules (cuisines, ingredients, tools) and cleaning logic are externalized in **YAML configuration files**. Customize the behavior without touching a line of code.
 *   **Beautiful CLI**: Built with `rich`, featuring real-time progress bars, status spinners, and formatted reports.
 *   **Production Ready**: Includes robust error handling, automated retries, and comprehensive logging.
+*   **Catalog Review**: Safely approve new foods and units, map aliases to existing catalog items, and retry blocked recipes.
 
 ## 🛠️ The Suite
 
@@ -17,6 +18,7 @@ KitchenOps is a production-ready suite of maintenance tools for [Mealie](https:/
 | **🧹 Auto-Cleaner** | `kitchen_ops_cleaner.py` | API | Low | 🚀 Fastest | Removes junk recipes, broken content, and listicles. |
 | **🏷️ Auto-Tagger** | `kitchen_ops_tagger.py` | API | High | ⚡ Fast | Tags recipes by cuisine, protein, cheese, etc. |
 | **🔧 Batch Parser** | `kitchen_ops_parser.py` | API | Low | 🐢 Slow | Fixes unparsed ingredients using Mealie's NLP engine. |
+| **📚 Catalog Review** | `kitchen_ops_parser.py --review-catalog` | API | Low | ⚡ Fast | Reviews queued foods, units, and aliases, then retries blocked recipes. |
 - **⚡ DB Accelerator:** 
   - Massive speedup for finding unparsed recipes (~20m → <1s)
   - Instant library scanning for Cleaner (~7h → <1s)
@@ -45,10 +47,12 @@ KitchenOps is configured via environment variables (for connection details) and 
 | `MEALIE_URL` | - | Your Mealie instance URL (e.g. `http://PLACEHOLDER_MEALIE_IP:9000`). |
 | `MEALIE_API_TOKEN` | - | API token from Mealie → User Profile → API Tokens. |
 | `DRY_RUN` | `true` | Set to `false` to apply changes. |
-| `SCRIPT_TO_RUN` | `parser` | Choose `tagger`, `parser`, `cleaner`, or `all`. |
+| `SCRIPT_TO_RUN` | `parser` | Choose `tagger`, `parser`, `catalog-review`, `cleaner`, or `all`. |
 | `LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
 | `PARSER_WORKERS` | `2` | Number of concurrent parsing threads. |
+| `PARSER_REVIEW_FILE` | `logs/parser_pending_catalog.json` | Persistent queue for recipes waiting on foods, units, or aliases. |
 | `CLEANER_WORKERS` | `2` | Number of concurrent integrity-check threads. |
+| `TAGGER_BULK_BATCH_SIZE` | `500` | Maximum recipes per bulk tag/category assignment request. |
 
 #### 🔴 Database Settings (Accelerator Mode)
 
@@ -75,6 +79,28 @@ To customize how KitchenOps behaves, edit the files in the `config/` directory:
 
 ---
 
+## 🖥️ Portainer: Manual-Only Operation
+
+The included `docker-compose.yml` starts KitchenOps in an idle state. Starting or redeploying the container does not contact Mealie or run any maintenance job; it only keeps the container available for a Portainer console session.
+
+To run a job:
+
+1. In Portainer, open the `mealie-kitchen-ops` container and select **Console**.
+2. Connect using `/bin/sh`.
+3. Launch exactly the job you want:
+
+```bash
+./entrypoint.sh parser
+./entrypoint.sh cleaner
+./entrypoint.sh tagger
+./entrypoint.sh catalog-review
+./entrypoint.sh all
+```
+
+The positional command takes precedence over `SCRIPT_TO_RUN`. Interactive console runs retain the dry-run and final confirmation prompts. When a job finishes, exit the console; the container's separate idle process remains running for the next manual job.
+
+---
+
 ## 📦 Quick Start (Docker)
 
 ```bash
@@ -89,15 +115,18 @@ docker pull ghcr.io/d0rk4ce/mealie-kitchen-ops:latest
 docker run -it --rm \
   --env-file .env \
   -v $(pwd)/config:/app/config \
+  -v $(pwd)/logs:/app/logs \
   ghcr.io/d0rk4ce/mealie-kitchen-ops:latest
 
 # 3b. Or choose a specific tool directly:
 docker run -it --rm \
   --env-file .env \
-  -e SCRIPT_TO_RUN=parser \
   -v $(pwd)/config:/app/config \
-  ghcr.io/d0rk4ce/mealie-kitchen-ops:latest
+  -v $(pwd)/logs:/app/logs \
+  ghcr.io/d0rk4ce/mealie-kitchen-ops:latest parser
 ```
+
+`SCRIPT_TO_RUN=parser` remains supported for existing automated deployments.
 
 Run `--help` for a full usage guide:
 ```bash
@@ -118,8 +147,31 @@ cp .env.example .env
 podman run -it --rm \
   --env-file .env \
   -v $(pwd)/config:/app/config:z \
+  -v $(pwd)/logs:/app/logs:z \
   ghcr.io/d0rk4ce/mealie-kitchen-ops:latest
 ```
+
+## 📚 Catalog Review Workflow
+
+The Batch Parser resolves canonical food and unit names, plurals, abbreviations, and existing aliases automatically. If Mealie's parser proposes a catalog item without an ID, KitchenOps leaves that entire recipe unchanged and records the proposal in `logs/parser_pending_catalog.json` instead of sending an invalid update.
+
+On an interactive live run, KitchenOps offers to review the queue after parsing. For each proposed food or unit you can create it, edit and create it, map it to an existing item while adding the proposed term as an alias, map it once without an alias, or defer it. A confirmed bulk action creates all remaining non-conflicting proposals.
+
+To resume the review later:
+
+```bash
+docker run -it --rm \
+  --env-file .env \
+  -e DRY_RUN=false \
+  -e SCRIPT_TO_RUN=catalog-review \
+  -v $(pwd)/config:/app/config \
+  -v $(pwd)/logs:/app/logs \
+  ghcr.io/d0rk4ce/mealie-kitchen-ops:latest
+```
+
+After all required foods and units for a recipe are resolved, KitchenOps refetches the recipe, verifies that its ingredients have not changed, and applies the stored proposal. Dry-run mode may populate the review queue, but it never creates catalog items, updates recipes, or marks recipes as completed.
+
+For unattended runs, pending catalog review is an expected outcome and exits successfully after saving the queue. API failures still produce a failed run.
 
 ---
 

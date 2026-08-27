@@ -1,5 +1,32 @@
 #!/bin/sh
 
+# Parse container commands before doing any setup or network access. The idle
+# command is used by long-lived deployments (for example, Portainer) so jobs
+# only run when an operator explicitly launches one from the container console.
+if [ "$#" -gt 1 ]; then
+    echo "KitchenOps accepts exactly one command." >&2
+    echo "Available commands: idle, tagger, parser, cleaner, catalog-review, all" >&2
+    exit 1
+fi
+
+POSITIONAL_SCRIPT=""
+case "${1:-}" in
+    idle)
+        echo "KitchenOps is idle. Launch a job from the container console with ./entrypoint.sh <command>."
+        exec tail -f /dev/null
+        ;;
+    tagger|parser|cleaner|catalog-review|all)
+        POSITIONAL_SCRIPT="$1"
+        ;;
+    --help|-h|--version|-v|"")
+        ;;
+    *)
+        echo "Unknown KitchenOps command: $1" >&2
+        echo "Available commands: idle, tagger, parser, cleaner, catalog-review, all" >&2
+        exit 1
+        ;;
+esac
+
 # Dynamically fetch the latest release tag from GitHub, fallback to 'latest'
 VERSION=$(python3 -c "import urllib.request, json; print(json.loads(urllib.request.urlopen('https://api.github.com/repos/D0rk4ce/mealie-kitchen-ops/releases').read())[0]['tag_name'])" 2>/dev/null || echo "latest")
 ENV_FILE="config/.env"
@@ -11,13 +38,18 @@ trap 'echo ""; echo "  ⛔ Interrupted. Exiting gracefully."; exit 130' INT TERM
 if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "KitchenOps ${VERSION} — Automation Suite for Mealie"
     echo ""
-    echo "Usage: Set the SCRIPT_TO_RUN environment variable to choose a tool,"
-    echo "       or run interactively to get a selection menu."
+    echo "Usage: ./entrypoint.sh [command]"
     echo ""
-    echo "  SCRIPT_TO_RUN=tagger   Auto-tag recipes by cuisine, protein, etc. (API)"
-    echo "  SCRIPT_TO_RUN=parser   Fix unparsed ingredients via NLP (API)"
-    echo "  SCRIPT_TO_RUN=cleaner  Remove junk / broken recipes (API)"
-    echo "  SCRIPT_TO_RUN=all      Run Tagger → Cleaner → Parser in sequence"
+    echo "Commands:"
+    echo "  idle            Keep the container running without launching a job"
+    echo "  tagger          Auto-tag recipes by cuisine, protein, etc. (API)"
+    echo "  parser          Fix unparsed ingredients via NLP (API)"
+    echo "  catalog-review  Review queued foods, units, and aliases"
+    echo "  cleaner         Remove junk / broken recipes (API)"
+    echo "  all             Run Tagger → Cleaner → Parser in sequence"
+    echo ""
+    echo "With no command, SCRIPT_TO_RUN is used when set; otherwise an interactive"
+    echo "terminal gets the selection menu and a non-interactive run defaults to parser."
     echo ""
     echo "Common Environment Variables:"
     echo "  DRY_RUN=true           Simulate changes without writing (default: true)"
@@ -94,15 +126,20 @@ show_menu() {
     echo "       • Requires: API Token"
     echo "       • Speed:    ⚡ Fast (Parallel API)"
     echo ""
-    echo "    4) 🚀 Run All"
+    echo "    4) 📚 Catalog Review"
+    echo "       Approve queued foods, units, aliases, and retry blocked recipes."
+    echo ""
+    echo "    5) 🚀 Run All"
     echo "       Execute the full suite: Tagger → Cleaner → Parser"
     echo ""
     echo "    0) ❌ Exit"
     echo ""
-    printf "  Enter choice [0-4]: "
+    printf "  Enter choice [0-5]: "
 }
 
-if [ -n "$SCRIPT_TO_RUN" ]; then
+if [ -n "$POSITIONAL_SCRIPT" ]; then
+    SCRIPT="$POSITIONAL_SCRIPT"
+elif [ -n "$SCRIPT_TO_RUN" ]; then
     SCRIPT="$SCRIPT_TO_RUN"
 elif [ -t 0 ]; then
     show_menu
@@ -111,14 +148,15 @@ elif [ -t 0 ]; then
         1) SCRIPT="parser"  ;;
         2) SCRIPT="cleaner" ;;
         3) SCRIPT="tagger"  ;;
-        4) SCRIPT="all"     ;;
+        4) SCRIPT="catalog-review" ;;
+        5) SCRIPT="all"     ;;
         0)
             echo "  Goodbye!"
             exit 0
             ;;
         *)
             echo ""
-            echo "  ❌ Invalid selection. Please run again and choose 0-4."
+            echo "  ❌ Invalid selection. Please run again and choose 0-5."
             exit 1
             ;;
     esac
@@ -126,6 +164,16 @@ elif [ -t 0 ]; then
 else
     SCRIPT="parser"
 fi
+
+case "$SCRIPT" in
+    tagger|parser|cleaner|catalog-review|all)
+        ;;
+    *)
+        echo "  ❌ Unknown script: $SCRIPT" >&2
+        echo "  Available options: tagger, parser, cleaner, catalog-review, all" >&2
+        exit 1
+        ;;
+esac
 
 # --- Failsafe: Wait for Mealie ---
 wait_for_mealie() {
@@ -274,6 +322,7 @@ case "$SCRIPT" in
     "parser")  SCRIPT_LABEL="🔧 Batch Parser" ;;
     "cleaner") SCRIPT_LABEL="🧹 Library Cleaner" ;;
     "tagger")  SCRIPT_LABEL="🏷️  Auto-Tagger (API)" ;;
+    "catalog-review") SCRIPT_LABEL="📚 Catalog Review (Foods, Units & Aliases)" ;;
     "all")     SCRIPT_LABEL="🚀 Full Suite (Tagger → Cleaner → Parser)" ;;
 esac
 
@@ -329,6 +378,11 @@ run_script() {
         echo "Starting Library Cleaner..."
         python3 kitchen_ops_cleaner.py
         ;;
+
+      "catalog-review")
+        echo "Starting Catalog Review..."
+        python3 kitchen_ops_parser.py --review-catalog
+        ;;
         
       "all")
         echo "Running Full Suite (Sequence: Tagger → Cleaner → Parser)..."
@@ -347,7 +401,7 @@ run_script() {
       *)
         echo "  ❌ Unknown script: $SCRIPT"
         echo ""
-        echo "  Available options: tagger, parser, cleaner, all"
+        echo "  Available options: tagger, parser, cleaner, catalog-review, all"
         echo "  Run with --help for more info."
         exit 1
         ;;
@@ -395,7 +449,8 @@ if [ -t 0 ]; then
                     1) SCRIPT="parser"  ;;
                     2) SCRIPT="cleaner" ;;
                     3) SCRIPT="tagger"  ;;
-                    4) SCRIPT="all"     ;;
+                    4) SCRIPT="catalog-review" ;;
+                    5) SCRIPT="all"     ;;
                     0) echo "  Goodbye!"; exit 0 ;;
                     *) echo "  ❌ Invalid. Exiting."; exit 1 ;;
                 esac

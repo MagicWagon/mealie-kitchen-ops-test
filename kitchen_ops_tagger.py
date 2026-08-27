@@ -12,8 +12,9 @@ import sys
 import time
 import yaml
 import signal
+from collections import defaultdict
 from datetime import datetime
-from typing import Dict
+from typing import Any, Dict, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rich.console import Console
@@ -154,6 +155,10 @@ API_TOKEN = os.getenv("MEALIE_API_TOKEN")
 DRY_RUN = os.getenv("DRY_RUN", "True").lower() == "true"
 MIN_CUISINE_MATCHES = 3
 SHUTDOWN_REQUESTED = False
+try:
+    BULK_BATCH_SIZE = max(1, int(os.getenv("TAGGER_BULK_BATCH_SIZE", "500")))
+except (TypeError, ValueError):
+    BULK_BATCH_SIZE = 500
 
 # Signal handler for graceful termination
 def signal_handler(sig, frame):
@@ -228,58 +233,152 @@ def check_match(text: str, include_regex: str, exclude_regex: str = None) -> boo
             return False
     return True
 
-def process_single_recipe(summary: Dict, headers: Dict):
+
+def _add_case_insensitive(values: set[str], value: str) -> None:
+    if value.casefold() not in {existing.casefold() for existing in values}:
+        values.add(value)
+
+
+ORGANIZER_RESOURCES = ("tags", "categories", "tools")
+
+
+def _fetch_catalog(resource: str, headers: Dict) -> Dict[str, dict]:
+    """Return all Mealie organizer entities keyed by case-insensitive name."""
+    items = []
+    page = 1
+    per_page = 500
+
+    while True:
+        response = requests.get(
+            f"{MEALIE_URL}/api/organizers/{resource}?page={page}&perPage={per_page}",
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        page_items = data.get("items", []) if isinstance(data, dict) else data
+        items.extend(page_items or [])
+
+        total_pages = data.get("total_pages") if isinstance(data, dict) else None
+        if not page_items or (total_pages and page >= total_pages) or (not total_pages and len(page_items) < per_page):
+            break
+        page += 1
+
+    return {
+        item["name"].casefold(): item
+        for item in items
+        if isinstance(item, dict) and item.get("name")
+    }
+
+
+def fetch_relationship_catalog(headers: Dict) -> Dict[str, Dict[str, dict]]:
+    """Load organizer catalogs once before the scan/write phases."""
+    return {resource: _fetch_catalog(resource, headers) for resource in ORGANIZER_RESOURCES}
+
+
+def _canonical_relationship(item: dict, resource: str) -> dict:
+    """Keep only the fields required by Mealie relationship schemas."""
+    required = ("name", "slug") if resource != "tools" else ("id", "name", "slug")
+    missing = [field for field in required if not item.get(field)]
+    if missing:
+        raise ValueError(f"Mealie {resource} entry {item.get('name', '<unnamed>')!r} is missing {', '.join(missing)}")
+    return {field: item[field] for field in ("id", "name", "slug") if field in item}
+
+
+def _relationship_payload(names: Iterable[str], original: Iterable[dict], catalog: Dict[str, dict], resource: str):
+    """Resolve relationship names to complete API objects, retaining existing objects as a fallback."""
+    original_by_name = {
+        item.get("name", "").casefold(): item
+        for item in original
+        if isinstance(item, dict) and item.get("name")
+    }
+    payload = []
+    for name in sorted(names, key=str.casefold):
+        item = catalog.get(name.casefold()) or original_by_name.get(name.casefold())
+        if item is None:
+            raise ValueError(f"Mealie {resource} catalog has no entry for {name!r}")
+        payload.append(_canonical_relationship(item, resource))
+    return payload
+
+
+def _recipe_categories(recipe: Dict[str, Any]) -> list[dict]:
+    """Mealie calls this relationship recipeCategory in both GET and PATCH schemas."""
+    return recipe.get("recipeCategory", []) or []
+
+
+def process_single_recipe(summary: Dict, headers: Dict, relationship_catalog=None):
+    """Scan one recipe and return a write-free tagging proposal."""
     slug = summary['slug']
     if SHUTDOWN_REQUESTED:
-        return {"slug": slug, "tags_added": [], "cats_added": [], "tools_added": [], "error": True, "shutdown_requested": True}
-    
-    result = {"slug": slug, "tags_added": [], "cats_added": [], "tools_added": [], "error": False}
+        return {"slug": slug, "error": True, "shutdown_requested": True}
+
+    result = {
+        "id": summary.get("id"),
+        "slug": slug,
+        "tags_added": [],
+        "categories_added": [],
+        "tools_added": [],
+        "desired_tags": [],
+        "desired_categories": [],
+        "desired_tools": [],
+        "original_tags": [],
+        "original_categories": [],
+        "original_tools": [],
+        "error": False,
+    }
     
     try:
         resp = requests.get(f"{MEALIE_URL}/api/recipes/{slug}", headers=headers, timeout=15)
+        resp.raise_for_status()
         recipe = resp.json()
+
+        result["id"] = recipe.get("id") or result["id"]
         
         # Text Blobs
         ing_text = " ".join([(i.get('food') or {}).get('name', '') + " " + i.get('note', '') for i in recipe.get('recipeIngredients', [])])
         inst_text = " ".join([step.get('text', '') for step in recipe.get('recipeInstructions', [])])
         cat_text = f"{recipe.get('name', '')} {slug}"
         
-        current_tags = {t['name'] for t in recipe.get('tags', [])}
+        current_tags = {t['name'] for t in recipe.get('tags', []) if t.get('name')}
         original_tags = set(current_tags)
-        
-        current_cats = {c['name'] for c in recipe.get('categories', [])}
+
+        current_cats = {c['name'] for c in _recipe_categories(recipe) if c.get('name')}
         original_cats = set(current_cats)
-        
-        current_tools = {t['name'] for t in recipe.get('tools', [])}
+
+        current_tools = {t['name'] for t in recipe.get('tools', []) if t.get('name')}
         original_tools = set(current_tools)
+
+        result["original_tags"] = recipe.get("tags", [])
+        result["original_categories"] = _recipe_categories(recipe)
+        result["original_tools"] = recipe.get("tools", [])
 
         # 1. Proteins
         for tag, rules in PROTEIN_TAGS.items():
             if check_match(ing_text, rules.get('regex', ''), rules.get('exclude')):
-                current_tags.add(tag)
+                _add_case_insensitive(current_tags, tag)
 
         # 2. Cheese
         for tag, regex in CHEESE_TYPES.items():
             if check_match(ing_text, regex):
-                current_tags.add(tag)
+                _add_case_insensitive(current_tags, tag)
 
         # 3. Cuisine
         for cuisine, regex in CUISINE_FINGERPRINTS.items():
             matches = len(re.findall(fr"\b({regex})\b", ing_text, re.I))
             if matches >= MIN_CUISINE_MATCHES:
-                current_tags.add(cuisine)
+                _add_case_insensitive(current_tags, cuisine)
                 
         # 4. Text Tags
         for tag, keywords in TEXT_ONLY_TAGS.items():
             chain = "|".join(keywords).replace("'", "''")
             if check_match(cat_text, chain): 
-                current_tags.add(tag)
+                _add_case_insensitive(current_tags, tag)
 
         # 5. Tools
         for tool, keywords in TOOLS_MATCHES.items():
             chain = "|".join(keywords)
             if check_match(inst_text, chain):
-                current_tools.add(tool)
+                _add_case_insensitive(current_tools, tool)
 
         # 6. Categories (Waterfall)
         if not current_cats:
@@ -289,32 +388,276 @@ def process_single_recipe(summary: Dict, headers: Dict):
                 
                 pattern = "|".join(keywords).replace("'", "''")
                 if check_match(cat_text, pattern):
-                    current_cats.add(cat_name)
+                    _add_case_insensitive(current_cats, cat_name)
                     break 
 
-        updates = {}
-        if current_tags != original_tags:
-            updates["tags"] = [{"name": t} for t in current_tags]
-            result["tags_added"] = list(current_tags - original_tags)
-            
-        if current_cats != original_cats:
-            updates["categories"] = [{"name": c} for c in current_cats]
-            result["cats_added"] = list(current_cats - original_cats)
-            
-        if current_tools != original_tools:
-            updates["tools"] = [{"name": t} for t in current_tools]
-            result["tools_added"] = list(current_tools - original_tools)
+        result["tags_added"] = sorted(current_tags - original_tags)
+        result["categories_added"] = sorted(current_cats - original_cats)
+        result["tools_added"] = sorted(current_tools - original_tools)
+        result["desired_tags"] = sorted(current_tags)
+        result["desired_categories"] = sorted(current_cats)
 
-        if updates and not DRY_RUN:
-            patch_resp = requests.patch(f"{MEALIE_URL}/api/recipes/{slug}", json=updates, headers=headers, timeout=15)
-            if not patch_resp.ok:
-                raise Exception(f"API Rejected Patch ({patch_resp.status_code}): {patch_resp.text}")
+        if result["tools_added"]:
+            result["desired_tools"] = sorted(current_tools)
 
         return result
     except Exception as e:
         logger.error(f"Error processing {slug}: {e}")
         result["error"] = True
         return result
+
+
+def _chunks(items: list, size: int):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def _matched_names(proposals: Iterable[Dict], field: str) -> set[str]:
+    return {
+        name
+        for proposal in proposals
+        if not proposal.get("error")
+        for name in proposal.get(field, [])
+    }
+
+
+def _ensure_missing_organizers(
+    resource: str,
+    names: Iterable[str],
+    catalog: Dict[str, dict],
+    headers: Dict,
+) -> tuple[Dict[str, dict], list[str]]:
+    missing = sorted(
+        {name for name in names if name.casefold() not in catalog},
+        key=str.casefold,
+    )
+    for name in missing:
+        response = requests.post(
+            f"{MEALIE_URL}/api/organizers/{resource}",
+            json={"name": name},
+            headers=headers,
+            timeout=30,
+        )
+        if response.status_code not in (200, 201, 409):
+            raise RuntimeError(
+                f"Unable to create Mealie {resource[:-1]} {name!r}: "
+                f"HTTP {response.status_code}: {response.text[:300]}"
+            )
+
+    if missing:
+        catalog = _fetch_catalog(resource, headers)
+    return catalog, missing
+
+
+def _post_bulk(path: str, payload: dict, headers: Dict):
+    return requests.post(
+        f"{MEALIE_URL}{path}",
+        json=payload,
+        headers=headers,
+        timeout=60,
+    )
+
+
+def _record_bulk_success(stats: Dict, field: str, proposals: list[Dict], name: str) -> None:
+    stats[field] += len(proposals)
+    stats["updated_slugs"].update(proposal["slug"] for proposal in proposals)
+    if field == "tags":
+        stats["tag_counts"][name] += len(proposals)
+
+
+def _apply_recipe_organizer_fallback(
+    proposal: Dict,
+    fields: set[str],
+    catalog: Dict[str, Dict[str, dict]],
+    headers: Dict,
+) -> tuple[str, bool, str | None]:
+    payload = {}
+    try:
+        if "tags" in fields:
+            payload["tags"] = _relationship_payload(
+                proposal["desired_tags"],
+                proposal["original_tags"],
+                catalog["tags"],
+                "tags",
+            )
+        if "categories" in fields:
+            payload["recipeCategory"] = _relationship_payload(
+                proposal["desired_categories"],
+                proposal["original_categories"],
+                catalog["categories"],
+                "categories",
+            )
+    except ValueError as exc:
+        return proposal["slug"], False, str(exc)
+
+    response = requests.patch(
+        f"{MEALIE_URL}/api/recipes/{proposal['slug']}",
+        json=payload,
+        headers=headers,
+        timeout=30,
+    )
+    if not response.ok:
+        return proposal["slug"], False, f"HTTP {response.status_code}: {response.text[:300]}"
+    return proposal["slug"], True, None
+
+
+def apply_tag_category_updates(
+    proposals: list[Dict],
+    catalog: Dict[str, Dict[str, dict]],
+    headers: Dict,
+) -> Dict:
+    """Apply tags/categories in bulk, falling back to standard APIs or recipe PATCH."""
+    stats = {
+        "tags": 0,
+        "categories": 0,
+        "tools": 0,
+        "errors": 0,
+        "updated_slugs": set(),
+        "tag_counts": defaultdict(int),
+    }
+    fallback_fields: Dict[str, set[str]] = defaultdict(set)
+    custom_available = True
+    standard_available = True
+
+    for field, resource, standard_path, payload_key in (
+        ("tags_added", "tags", "/api/recipes/bulk-actions/tag", "tags"),
+        ("categories_added", "categories", "/api/recipes/bulk-actions/categorize", "categories"),
+    ):
+        groups: Dict[str, list[Dict]] = defaultdict(list)
+        for proposal in proposals:
+            if proposal.get("error"):
+                continue
+            for name in proposal.get(field, []):
+                groups[name.casefold()].append(proposal)
+
+        for key, group in groups.items():
+            name = next(name for name in group[0][field] if name.casefold() == key)
+            item = catalog[resource].get(key)
+            if item is None:
+                stats["errors"] += len(group)
+                logger.error(f"Unresolved Mealie {resource[:-1]} {name!r}; skipping {len(group)} recipes")
+                continue
+            canonical = _canonical_relationship(item, resource)
+
+            for batch in _chunks(group, BULK_BATCH_SIZE):
+                if custom_available and all(proposal.get("id") for proposal in batch):
+                    response = _post_bulk(
+                        "/api/recipes/bulk-actions/organize",
+                        {
+                            "recipes": [proposal["id"] for proposal in batch],
+                            "operation": "add",
+                            "tags": [canonical] if resource == "tags" else [],
+                            "categories": [canonical] if resource == "categories" else [],
+                        },
+                        headers,
+                    )
+                    if response.status_code not in (404, 405):
+                        if response.ok:
+                            _record_bulk_success(stats, "tags" if resource == "tags" else "categories", batch, name)
+                            continue
+                        stats["errors"] += len(batch)
+                        logger.error(
+                            f"Bulk organizer update failed for {resource[:-1]} {name!r}: "
+                            f"HTTP {response.status_code}: {response.text[:300]}"
+                        )
+                        continue
+                    custom_available = False
+
+                if standard_available:
+                    response = _post_bulk(
+                        standard_path,
+                        {
+                            "recipes": [proposal["slug"] for proposal in batch],
+                            payload_key: [canonical],
+                        },
+                        headers,
+                    )
+                    if response.status_code not in (404, 405):
+                        if response.ok:
+                            _record_bulk_success(stats, "tags" if resource == "tags" else "categories", batch, name)
+                            continue
+                        stats["errors"] += len(batch)
+                        logger.error(
+                            f"Standard bulk update failed for {resource[:-1]} {name!r}: "
+                            f"HTTP {response.status_code}: {response.text[:300]}"
+                        )
+                        continue
+                    standard_available = False
+
+                for proposal in batch:
+                    fallback_fields[proposal["slug"]].add("tags" if resource == "tags" else "categories")
+
+    if fallback_fields:
+        by_slug = {proposal["slug"]: proposal for proposal in proposals}
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    _apply_recipe_organizer_fallback,
+                    by_slug[slug],
+                    fields,
+                    catalog,
+                    headers,
+                ): slug
+                for slug, fields in fallback_fields.items()
+            }
+            for future in as_completed(futures):
+                slug, succeeded, error = future.result()
+                proposal = by_slug[slug]
+                if succeeded:
+                    fields = fallback_fields[slug]
+                    if "tags" in fields:
+                        stats["tags"] += len(proposal.get("tags_added", []))
+                        for tag in proposal.get("tags_added", []):
+                            stats["tag_counts"][tag] += 1
+                    if "categories" in fields:
+                        stats["categories"] += len(proposal.get("categories_added", []))
+                    stats["updated_slugs"].add(slug)
+                else:
+                    stats["errors"] += 1
+                    logger.error(f"Fallback organizer update failed for {slug}: {error}")
+
+    return stats
+
+
+def _apply_tool_update(proposal: Dict, catalog: Dict[str, dict], headers: Dict):
+    try:
+        tools = _relationship_payload(
+            proposal["desired_tools"],
+            proposal["original_tools"],
+            catalog,
+            "tools",
+        )
+    except ValueError as exc:
+        return proposal["slug"], False, str(exc)
+
+    response = requests.patch(
+        f"{MEALIE_URL}/api/recipes/{proposal['slug']}",
+        json={"tools": tools},
+        headers=headers,
+        timeout=30,
+    )
+    if not response.ok:
+        return proposal["slug"], False, f"HTTP {response.status_code}: {response.text[:300]}"
+    return proposal["slug"], True, None
+
+
+def apply_tool_updates(proposals: list[Dict], catalog: Dict[str, dict], headers: Dict) -> Dict:
+    stats = {"tools": 0, "errors": 0, "updated_slugs": set()}
+    candidates = [proposal for proposal in proposals if proposal.get("tools_added") and not proposal.get("error")]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(_apply_tool_update, proposal, catalog, headers): proposal["slug"]
+            for proposal in candidates
+        }
+        for future in as_completed(futures):
+            slug, succeeded, error = future.result()
+            if succeeded:
+                stats["tools"] += 1
+                stats["updated_slugs"].add(slug)
+            else:
+                stats["errors"] += 1
+                logger.error(f"Tool update failed for {slug}: {error}")
+    return stats
 
 def format_elapsed(seconds: float) -> str:
     s = int(seconds)
@@ -341,10 +684,13 @@ def main():
         console.print("[warning]No recipes found on the server.[/warning]")
         sys.exit(0)
 
-    updated_count = 0
-    cuisine_counts = {c: 0 for c in CUISINE_FINGERPRINTS.keys()}
-    untagged_count = 0
-    
+    try:
+        relationship_catalog = fetch_relationship_catalog(headers)
+    except Exception as exc:
+        logger.error(f"Unable to load Mealie tag/category/tool catalogs: {exc}")
+        sys.exit(1)
+
+    proposals = []
     try:
         with Progress(
             SpinnerColumn(),
@@ -353,10 +699,13 @@ def main():
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
             console=console
         ) as progress:
-            task = progress.add_task(f"Tagging {total} recipes...", total=total)
+            task = progress.add_task(f"Scanning {total} recipes...", total=total)
             
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = {executor.submit(process_single_recipe, s, headers): s for s in summaries}
+                futures = {
+                    executor.submit(process_single_recipe, s, headers, relationship_catalog): s
+                    for s in summaries
+                }
                 
                 for future in as_completed(futures):
                     if SHUTDOWN_REQUESTED:
@@ -368,22 +717,76 @@ def main():
                     
                     if res.get("shutdown_requested"):
                         continue
-                        
-                    if res["tags_added"] or res["cats_added"] or res["tools_added"]:
-                        updated_count += 1
-                        
-                    if not res["tags_added"] and not futures[future].get('tags'):
-                        untagged_count += 1
 
-                    for tag in res["tags_added"]:
-                        if tag in cuisine_counts:
-                            cuisine_counts[tag] += 1
-                            
-                    progress.update(task, advance=1, description=f"Updated: {updated_count} | Total: {total}")
+                    proposals.append(res)
+                    progress.update(task, advance=1, description=f"Scanned: {len(proposals)} | Total: {total}")
     except KeyboardInterrupt:
         executor.shutdown(wait=False, cancel_futures=True)
         console.print("\n[warning]🛑 Interrupted by user during tagging. Shutting down cleanly...[/warning]")
         sys.exit(1)
+
+    planned_tag_names = _matched_names(proposals, "tags_added")
+    planned_category_names = _matched_names(proposals, "categories_added")
+    missing_tag_names = sorted(
+        (name for name in planned_tag_names if name.casefold() not in relationship_catalog["tags"]),
+        key=str.casefold,
+    )
+    missing_category_names = sorted(
+        (name for name in planned_category_names if name.casefold() not in relationship_catalog["categories"]),
+        key=str.casefold,
+    )
+
+    if DRY_RUN:
+        console.print(
+            f"[warning]Dry Run: would add {len(planned_tag_names)} tag types and "
+            f"{len(planned_category_names)} category types.[/warning]"
+        )
+        if missing_tag_names or missing_category_names:
+            console.print(
+                f"[warning]Would create {len(missing_tag_names)} tags and "
+                f"{len(missing_category_names)} categories.[/warning]"
+            )
+        organizer_stats = {
+            "tags": sum(len(proposal.get("tags_added", [])) for proposal in proposals),
+            "categories": sum(len(proposal.get("categories_added", [])) for proposal in proposals),
+            "tools": sum(bool(proposal.get("tools_added")) for proposal in proposals),
+            "errors": sum(bool(proposal.get("error")) for proposal in proposals),
+            "updated_slugs": set(),
+            "tag_counts": defaultdict(int),
+        }
+        for proposal in proposals:
+            for tag in proposal.get("tags_added", []):
+                organizer_stats["tag_counts"][tag] += 1
+        tool_stats = {"tools": 0, "errors": 0, "updated_slugs": set()}
+    else:
+        try:
+            relationship_catalog["tags"], created_tags = _ensure_missing_organizers(
+                "tags", planned_tag_names, relationship_catalog["tags"], headers
+            )
+            relationship_catalog["categories"], created_categories = _ensure_missing_organizers(
+                "categories", planned_category_names, relationship_catalog["categories"], headers
+            )
+            if created_tags or created_categories:
+                logger.info(
+                    f"Created organizers | Tags: {len(created_tags)} | Categories: {len(created_categories)}"
+                )
+        except Exception as exc:
+            logger.error(f"Unable to create missing tag/category organizers: {exc}")
+            sys.exit(1)
+
+        organizer_stats = apply_tag_category_updates(proposals, relationship_catalog, headers)
+        tool_stats = apply_tool_updates(proposals, relationship_catalog["tools"], headers)
+
+    updated_slugs = organizer_stats["updated_slugs"] | tool_stats["updated_slugs"]
+    updated_count = len(updated_slugs)
+    cuisine_counts = {c: organizer_stats["tag_counts"].get(c, 0) for c in CUISINE_FINGERPRINTS.keys()}
+    untagged_count = sum(
+        not proposal.get("error")
+        and not proposal.get("tags_added")
+        and not proposal.get("categories_added")
+        and not proposal.get("tools_added")
+        for proposal in proposals
+    )
 
     # Final Report Output
     console.print("\n")
@@ -398,7 +801,11 @@ def main():
     if table.row_count > 0:
         console.print(table)
         
-    console.print(f"\n[bold red]Untagged Recipes Left (Approx):[/bold red] {untagged_count}")
+    console.print(f"\n[bold green]Successful tag assignments:[/bold green] {organizer_stats['tags']}")
+    console.print(f"[bold green]Successful category assignments:[/bold green] {organizer_stats['categories']}")
+    console.print(f"[bold green]Successful tool updates:[/bold green] {tool_stats['tools']}")
+    console.print(f"[bold red]Write errors:[/bold red] {organizer_stats['errors'] + tool_stats['errors']}")
+    console.print(f"[bold red]Untagged Recipes Left (Approx):[/bold red] {untagged_count}")
 
     elapsed = time.time() - start_time
     console.print(f"\n⏱️  Elapsed: {format_elapsed(elapsed)}")

@@ -1,6 +1,8 @@
 """KitchenOps Batch Parser — fixes unparsed recipe ingredients via Mealie's NLP API."""
 
-import concurrent.futures, json, logging, os, signal, sys, threading, time
+import argparse
+import concurrent.futures, copy, json, logging, os, signal, sys, threading, time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
@@ -9,7 +11,17 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, TimeElapsedColumn
+from rich.prompt import Confirm
 from rich.theme import Theme
+
+from kitchen_ops_catalog import (
+    CatalogApi,
+    CatalogIndex,
+    CatalogReviewer,
+    PendingCatalogQueue,
+    pending_summary,
+    replay_ready_recipes,
+)
 
 # Rich Console Setup
 custom_theme = Theme({
@@ -37,6 +49,7 @@ MAX_WORKERS: int = int(os.getenv("PARSER_WORKERS", "8"))
 DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() == "true"
 CONFIDENCE_THRESHOLD: float = 0.85
 HISTORY_FILE: str = "parse_history.json"
+REVIEW_FILE: str = os.getenv("PARSER_REVIEW_FILE", "logs/parser_pending_catalog.json")
 SAVE_INTERVAL: int = 20
 
 # Database config (optional — enables fast startup)
@@ -48,10 +61,8 @@ PG_PASS: str = os.getenv('POSTGRES_PASSWORD', 'mealie')
 PG_HOST: str = os.getenv('POSTGRES_HOST', 'postgres')
 PG_PORT: str = os.getenv('POSTGRES_PORT', '5432')
 
-FOOD_CACHE: dict[str, str] = {}
-UNIT_CACHE: dict[str, str] = {}
+CATALOG_INDEX = CatalogIndex()
 HISTORY_SET: set[str] = set()
-CACHE_LOCK = threading.Lock()
 HISTORY_LOCK = threading.Lock()
 thread_local = threading.local()
 
@@ -136,69 +147,17 @@ def connect_db() -> Optional[object]:
     return None
 
 
-def prime_cache_db(conn) -> bool:
-    """Prime the cache using direct SQL queries (Fast). Returns True on success."""
-    try:
-        cursor = conn.cursor()
-        with CACHE_LOCK:
-            # Fetch Foods - Verified table name from tagger is 'ingredient_foods'
-            # We skip 'units' here because table name is uncertain (maybe 'ingredient_units'?) 
-            # and it's small enough (~700 items) to fetch via API quickly.
-            cursor.execute("SELECT id, name FROM ingredient_foods")
-            for fid, name in cursor.fetchall():
-                FOOD_CACHE[name.lower().strip()] = fid
-        
-        console.print(f"[info]DB Cache ready: {len(FOOD_CACHE)} foods loaded from SQL.[/info]")
-        return True
-    except Exception as e:
-        console.print(f"[warning]DB Cache Prime failed ({e}), falling back to API...[/warning]")
-        return False
-
-
-def prime_cache() -> None:
-    with console.status("[bold green]Prime Cache: Fetching foods & units...[/bold green]", spinner="dots"):
-        session = requests.Session()
-        session.headers.update({"Authorization": f"Bearer {API_TOKEN}"})
-
-        # Units
-        page = 1
-        while True:
-            try:
-                r = session.get(f"{MEALIE_URL}/api/units?page={page}&perPage=2000", timeout=10)
-                if r.status_code != 200:
-                    break
-                data = r.json()
-                items = data.get("items", [])
-                if not items:
-                    break
-                with CACHE_LOCK:
-                    for item in items:
-                        UNIT_CACHE[item["name"].lower().strip()] = item["id"]
-                        if item.get("pluralName"):
-                            UNIT_CACHE[item["pluralName"].lower().strip()] = item["id"]
-                page += 1
-            except requests.RequestException:
-                break
-
-        # Foods
-        page = 1
-        while True:
-            try:
-                r = session.get(f"{MEALIE_URL}/api/foods?page={page}&perPage=2000", timeout=10)
-                if r.status_code != 200:
-                    break
-                data = r.json()
-                items = data.get("items", [])
-                if not items:
-                    break
-                with CACHE_LOCK:
-                    for item in items:
-                        FOOD_CACHE[item["name"].lower().strip()] = item["id"]
-                page += 1
-            except requests.RequestException:
-                break
-
-    console.print(f"[info]Cache ready: {len(FOOD_CACHE)} foods, {len(UNIT_CACHE)} units.[/info]")
+def refresh_catalog(api: CatalogApi) -> None:
+    """Fetch canonical foods, units, abbreviations, and aliases from Mealie."""
+    with console.status(
+        "[bold green]Prime Catalog: Fetching foods, units & aliases...[/bold green]",
+        spinner="dots",
+    ):
+        api.refresh(CATALOG_INDEX)
+    console.print(
+        f"[info]Catalog ready: {len(CATALOG_INDEX.items['food'])} foods, "
+        f"{len(CATALOG_INDEX.items['unit'])} units.[/info]"
+    )
 
 
 def get_recipes_needing_parsing_db(conn) -> Optional[list[dict]]:
@@ -258,27 +217,101 @@ def get_all_recipes() -> list[dict]:
     return recipes
 
 
-def get_id_for_food(name: str) -> Optional[str]:
-    if not name:
-        return None
-    with CACHE_LOCK:
-        return FOOD_CACHE.get(name.lower().strip())
+@dataclass
+class ProcessResult:
+    status: str
+    slug: str
+    blocked_record: Optional[dict[str, Any]] = None
+    error: str = ""
 
 
-def process_recipe(slug: str) -> bool:
+def _raw_text(item: Any) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return str(item.get("note") or "")
+    return str(item or "")
+
+
+def _resolve_catalog_reference(
+    kind: str,
+    target: dict[str, Any],
+    ingredient_index: int,
+    raw_item: Any,
+    missing: list[dict[str, Any]],
+) -> None:
+    reference = target.get(kind)
+    if not reference:
+        return
+    if not isinstance(reference, dict):
+        missing.append(
+            {
+                "kind": kind,
+                "name": str(reference),
+                "proposal": {"name": str(reference)},
+                "ingredientIndex": ingredient_index,
+                "raw": _raw_text(raw_item),
+                "ambiguous": False,
+            }
+        )
+        target[kind] = {"name": str(reference)}
+        return
+
+    name = str(reference.get("name") or "").strip()
+    resolved, ambiguous = CATALOG_INDEX.resolve(kind, name) if name else (None, False)
+    if resolved:
+        target[kind] = {"id": resolved["id"], "name": resolved["name"]}
+        return
+    if reference.get("id"):
+        # The parser may return a valid ID that is outside this household's paginated catalog.
+        return
+
+    proposal_fields = (
+        ("name", "pluralName", "description", "aliases")
+        if kind == "food"
+        else (
+            "name",
+            "pluralName",
+            "description",
+            "fraction",
+            "abbreviation",
+            "pluralAbbreviation",
+            "useAbbreviation",
+            "aliases",
+        )
+    )
+    proposal = {
+        key: copy.deepcopy(reference[key])
+        for key in proposal_fields
+        if key in reference and reference[key] is not None
+    }
+    proposal.setdefault("name", name)
+    missing.append(
+        {
+            "kind": kind,
+            "name": name,
+            "proposal": proposal,
+            "ingredientIndex": ingredient_index,
+            "raw": _raw_text(raw_item),
+            "ambiguous": ambiguous,
+        }
+    )
+
+
+def process_recipe(slug: str) -> ProcessResult:
     if SHUTDOWN_REQUESTED:
-        return False
+        return ProcessResult("failed", slug, error="shutdown requested")
         
     session = get_session()
     try:
         r = session.get(f"{MEALIE_URL}/api/recipes/{slug}", timeout=15)
         if r.status_code != 200:
-            return False
+            return ProcessResult("failed", slug, error=f"recipe GET returned {r.status_code}")
         full_recipe = r.json()
-    except requests.RequestException:
-        return False
+    except requests.RequestException as exc:
+        return ProcessResult("failed", slug, error=str(exc))
 
-    raw_ingredients = full_recipe.get("recipeIngredient", [])
+    raw_ingredients = copy.deepcopy(full_recipe.get("recipeIngredient", []))
     to_parse: list[str] = []
     to_parse_indices: list[int] = []
     clean_ingredients: list[Optional[dict]] = []
@@ -296,7 +329,7 @@ def process_recipe(slug: str) -> bool:
             clean_ingredients.append(item)
 
     if not to_parse:
-        return True
+        return ProcessResult("success", slug)
 
     # NLP pass
     try:
@@ -305,16 +338,23 @@ def process_recipe(slug: str) -> bool:
             json={"ingredients": to_parse, "parser": "nlp", "language": "en"},
             timeout=30
         )
-        nlp_results = r_nlp.json() if r_nlp.status_code == 200 else []
+        if r_nlp.status_code != 200:
+            return ProcessResult("failed", slug, error=f"NLP parser returned {r_nlp.status_code}")
+        nlp_results = r_nlp.json()
         retry_sub_indices: list[int] = []
         retry_texts: list[str] = []
 
-        for idx, res in enumerate(nlp_results):
+        for idx, text in enumerate(to_parse):
+            if idx >= len(nlp_results):
+                retry_sub_indices.append(to_parse_indices[idx])
+                retry_texts.append(text)
+                continue
+            res = nlp_results[idx]
             score = res.get("confidence", {}).get("average", 0)
             actual_index = to_parse_indices[idx]
             if score < CONFIDENCE_THRESHOLD:
                 retry_sub_indices.append(actual_index)
-                retry_texts.append(to_parse[idx])
+                retry_texts.append(text)
             else:
                 clean_ingredients[actual_index] = res
 
@@ -328,39 +368,62 @@ def process_recipe(slug: str) -> bool:
                 )
                 if r_ai.status_code == 200:
                     for ai_idx, ai_res in enumerate(r_ai.json()):
-                        clean_ingredients[retry_sub_indices[ai_idx]] = ai_res
-            except requests.RequestException:
-                pass
+                        if ai_idx < len(retry_sub_indices):
+                            clean_ingredients[retry_sub_indices[ai_idx]] = ai_res
+            except requests.RequestException as exc:
+                return ProcessResult("failed", slug, error=f"OpenAI parser failed: {exc}")
 
-    except requests.RequestException:
-        return False
+    except requests.RequestException as exc:
+        return ProcessResult("failed", slug, error=str(exc))
 
     # Reconstruct
     final_list: list[Any] = []
+    missing: list[dict[str, Any]] = []
     for i, item in enumerate(clean_ingredients):
         if item is None:
             final_list.append(raw_ingredients[i])
         else:
-            target = item.get("ingredient", item)
+            target = copy.deepcopy(item.get("ingredient", item))
             for bad_key in ("referenceId", "id", "recipeId", "stepId", "labelId"):
                 target.pop(bad_key, None)
-            food = target.get("food")
-            if food and food.get("name"):
-                fid = get_id_for_food(food["name"])
-                if fid:
-                    food["id"] = fid
+            _resolve_catalog_reference("food", target, i, raw_ingredients[i], missing)
+            _resolve_catalog_reference("unit", target, i, raw_ingredients[i], missing)
             final_list.append(target)
+
+    if missing:
+        for item in missing:
+            logger.info(
+                "MISSING %s: %r | recipe=%s index=%s raw=%r",
+                item["kind"],
+                item.get("name"),
+                slug,
+                item["ingredientIndex"],
+                item.get("raw"),
+            )
+        return ProcessResult(
+            "blocked",
+            slug,
+            blocked_record={
+                "slug": slug,
+                "sourceIngredients": raw_ingredients,
+                "proposedIngredients": final_list,
+                "missing": missing,
+                "queuedAt": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
 
     full_recipe["recipeIngredient"] = final_list
 
     if DRY_RUN:
-        return True
+        return ProcessResult("dry_run", slug)
 
     try:
         r_update = session.put(f"{MEALIE_URL}/api/recipes/{slug}", json=full_recipe, timeout=15)
-        return r_update.status_code == 200
-    except requests.RequestException:
-        return False
+        if 200 <= r_update.status_code < 300:
+            return ProcessResult("success", slug)
+        return ProcessResult("failed", slug, error=f"recipe PUT returned {r_update.status_code}: {r_update.text[:300]}")
+    except requests.RequestException as exc:
+        return ProcessResult("failed", slug, error=str(exc))
 
 
 def format_elapsed(seconds: float) -> str:
@@ -374,14 +437,92 @@ def format_elapsed(seconds: float) -> str:
     return f"{s}s"
 
 
-if __name__ == "__main__":
+def review_pending_catalog(
+    api: CatalogApi,
+    queue: PendingCatalogQueue,
+    *,
+    ask_first: bool,
+) -> int:
+    if not queue.recipes:
+        console.print("[success]No recipes are waiting on catalog review.[/success]")
+        return 0
+
+    pending_summary(console, queue, CATALOG_INDEX)
+    if DRY_RUN:
+        console.print(
+            "[warning]Dry Run is enabled. Catalog decisions and recipe updates are disabled.[/warning]"
+        )
+        console.print("Run with DRY_RUN=false and SCRIPT_TO_RUN=catalog-review to apply decisions.")
+        return 0
+    if not sys.stdin.isatty():
+        console.print(
+            "[warning]Catalog review is pending. Run interactively with "
+            "SCRIPT_TO_RUN=catalog-review.[/warning]"
+        )
+        return 0
+    if ask_first and not Confirm.ask("Review pending foods and units now?", default=True, console=console):
+        console.print("Review deferred; the queue has been saved.")
+        return 0
+
+    reviewer = CatalogReviewer(queue, CATALOG_INDEX, api, console)
+    action_failures = reviewer.review()
+    try:
+        api.refresh(CATALOG_INDEX)
+        stats = replay_ready_recipes(
+            queue,
+            CATALOG_INDEX,
+            api,
+            HISTORY_SET,
+            logger=lambda message: logger.info(message),
+        )
+    except Exception as exc:
+        console.print(f"[error]Catalog replay failed: {exc}[/error]")
+        return 1
+    save_history()
+    console.print(
+        "Recipe retry: "
+        f"[green]{stats['updated']} updated[/green], "
+        f"[yellow]{stats['waiting']} waiting[/yellow], "
+        f"[yellow]{stats['stale']} stale[/yellow], "
+        f"[red]{stats['failed']} failed[/red]"
+    )
+    return 1 if action_failures or stats["failed"] else 0
+
+
+def main() -> int:
+    global HISTORY_SET
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--review-catalog",
+        action="store_true",
+        help="review queued foods and units, then retry affected recipes",
+    )
+    args = parser.parse_args()
+
     console.rule("[bold cyan]KitchenOps Batch Parser[/bold cyan]")
     console.print(f"Mealie: [underline]{MEALIE_URL}[/underline] | Workers: {MAX_WORKERS} | Dry Run: {DRY_RUN}")
     logger.info(f"Started | Mealie: {MEALIE_URL} | Workers: {MAX_WORKERS} | Dry Run: {DRY_RUN}")
 
     if not API_TOKEN:
         console.print("[error]MEALIE_API_TOKEN is not set. Cannot proceed.[/error]")
-        sys.exit(1)
+        return 1
+
+    api = CatalogApi(MEALIE_URL, API_TOKEN, session=get_session())
+    queue = PendingCatalogQueue(REVIEW_FILE).load()
+    if queue.corrupt_backup:
+        console.print(
+            f"[warning]The review queue was corrupt and was preserved at "
+            f"{queue.corrupt_backup}.[/warning]"
+        )
+    try:
+        refresh_catalog(api)
+    except Exception as exc:
+        console.print(f"[error]Could not load Mealie catalog: {exc}[/error]")
+        return 1
+    HISTORY_SET = load_history()
+
+    if args.review_catalog:
+        return review_pending_catalog(api, queue, ask_first=False)
 
     start_time = time.time()
     
@@ -391,54 +532,31 @@ if __name__ == "__main__":
     
     if db_conn:
         console.print(f"[info]DB Connection established ({DB_TYPE}). Accelerated mode active.[/info]")
-        
-        # 1. Prime Cache via DB (Foods only)
-        if prime_cache_db(db_conn):
-            # Manually fetch units via API since we skipped them in DB
-            with console.status("[bold green]Fetching units via API...[/bold green]", spinner="dots"):
-                 # Mini-routine to just fetch units
-                session = requests.Session()
-                session.headers.update({"Authorization": f"Bearer {API_TOKEN}"})
-                page = 1
-                while True:
-                    try:
-                        r = session.get(f"{MEALIE_URL}/api/units?page={page}&perPage=2000", timeout=10)
-                        if r.status_code != 200: break
-                        items = r.json().get("items", [])
-                        if not items: break
-                        with CACHE_LOCK:
-                            for item in items:
-                                UNIT_CACHE[item["name"].lower().strip()] = item["id"]
-                                if item.get("pluralName"):
-                                    UNIT_CACHE[item["pluralName"].lower().strip()] = item["id"]
-                        page += 1
-                    except requests.RequestException:
-                        break
-        else:
-            prime_cache() # Full API fallback if food fetch failed
-            
-        # 2. Get Candidates via DB
         candidates = get_recipes_needing_parsing_db(db_conn)
         db_conn.close()
     
     # Fallback if DB failed or not configured
     if candidates is None:
-        if not db_conn:
-            prime_cache()
-            
         candidates = get_all_recipes()
 
-    HISTORY_SET = load_history()
-    todo = [r for r in candidates if r["slug"] not in HISTORY_SET]
+    todo = [
+        recipe
+        for recipe in candidates
+        if recipe["slug"] not in HISTORY_SET or recipe["slug"] in queue.recipes
+    ]
     
     console.print(f"[info]Recipes: {len(candidates)} total, {len(HISTORY_SET)} already done, {len(todo)} remaining[/info]")
     logger.info(f"Recipes: {len(candidates)} total, {len(HISTORY_SET)} done, {len(todo)} remaining")
 
     if not todo:
         console.print("[success]All recipes parsed! Nothing to do.[/success]")
-        sys.exit(0)
+        if queue.recipes:
+            return review_pending_catalog(api, queue, ask_first=True)
+        return 0
 
     count = 0
+    dry_run_count = 0
+    blocked = 0
     failed = 0
     with Progress(
         SpinnerColumn(),
@@ -462,27 +580,57 @@ if __name__ == "__main__":
                     
                 slug = future_to_slug[future]
                 try:
-                    if future.result():
-                        with HISTORY_LOCK:
-                            HISTORY_SET.add(slug)
+                    result = future.result()
+                    if result.status == "success":
+                        queue.remove_recipe(slug)
+                        if not DRY_RUN:
+                            with HISTORY_LOCK:
+                                HISTORY_SET.add(slug)
                         count += 1
                         logger.info(f"OK: {slug}")
-                        if count % SAVE_INTERVAL == 0:
+                        if not DRY_RUN and count % SAVE_INTERVAL == 0:
                             save_history()
+                    elif result.status == "dry_run":
+                        dry_run_count += 1
+                        logger.info(f"DRY RUN: {slug}")
+                    elif result.status == "blocked" and result.blocked_record:
+                        blocked += 1
+                        with HISTORY_LOCK:
+                            HISTORY_SET.discard(slug)
+                        queue.upsert_recipe(result.blocked_record)
+                        queue.save()
+                        logger.info(f"BLOCKED: {slug} — pending catalog review")
                     else:
                         failed += 1
-                        logger.info(f"FAIL: {slug}")
+                        logger.info(f"FAIL: {slug} — {result.error}")
                 except Exception as e:
                     failed += 1
                     logger.info(f"ERROR: {slug} — {e}")
                 progress.advance(task)
 
     elapsed = time.time() - start_time
-    save_history()
+    queue.save()
+    if not DRY_RUN:
+        save_history()
     console.rule("[bold green]Batch Parse Complete[/bold green]")
-    console.print(f"Processed: [green]{count}[/green] | Failed: [red]{failed}[/red] | Total: [cyan]{len(todo)}[/cyan]")
+    console.print(
+        f"Processed: [green]{count}[/green] | Dry Run: [cyan]{dry_run_count}[/cyan] | "
+        f"Catalog Review: [yellow]{blocked}[/yellow] | Failed: [red]{failed}[/red] | "
+        f"Total: [cyan]{len(todo)}[/cyan]"
+    )
     console.print(f"⏱️  Elapsed: {format_elapsed(elapsed)}")
     if count > 0:
         rate = count / (elapsed / 60) if elapsed > 0 else 0
         console.print(f"📊 Rate: {rate:.1f} recipes/min")
-    logger.info(f"Complete | OK: {count} | Failed: {failed} | Elapsed: {format_elapsed(elapsed)}")
+    logger.info(
+        f"Complete | OK: {count} | Dry Run: {dry_run_count} | Blocked: {blocked} | "
+        f"Failed: {failed} | Elapsed: {format_elapsed(elapsed)}"
+    )
+    review_status = 0
+    if queue.recipes:
+        review_status = review_pending_catalog(api, queue, ask_first=True)
+    return 1 if failed or review_status else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

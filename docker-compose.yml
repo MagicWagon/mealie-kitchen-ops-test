@@ -1,9 +1,17 @@
 services:
   kitchen-ops:
-    build: .
-    container_name: kitchen_ops
+    image: mealie-kitchen-ops:bulk-organizers-20260826
+    container_name: mealie-kitchen-ops
     env_file: .env
-    # The volumes below are examples. Users must update them to match their setup.
+    command: ["idle"]
     volumes:
-      - ./data:/app/data:z # For SQLite users (Accelerator Mode): Mount the folder containing mealie.db
-    restart: no
+      - /docker/appdata/mealie/mealie.db:/app/data/mealie.db:ro
+      - /docker/appdata/kitchen-ops/config:/app/config:ro
+      - /docker/appdata/kitchen-ops/logs:/app/logs
+    networks:
+      - media_proxy
+    restart: "no"
+
+networks:
+  media_proxy:
+    external: true

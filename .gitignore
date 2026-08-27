@@ -19,5 +19,4 @@ parse_history.json
 # Tools & Dev
 *_readme.py
 docker-compose.sandbox.yml
-tests/
 .pytest_cache/
