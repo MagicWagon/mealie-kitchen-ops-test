@@ -12,12 +12,13 @@ import tempfile
 import threading
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 import requests
+import yaml
 from rapidfuzz import fuzz
 from rich.console import Console
 from rich.markup import escape
@@ -27,6 +28,92 @@ from rich.table import Table
 
 QUEUE_VERSION = 1
 CATALOG_KINDS = ("food", "unit")
+
+
+def _load_tool_matches() -> dict[str, list[str]]:
+    config_path = Path(__file__).resolve().parent / "config" / "tagging.yaml"
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        configured = data.get("tools_matches") or {}
+        return {
+            str(name): [str(value) for value in values if value]
+            for name, values in configured.items()
+            if name and isinstance(values, list)
+        }
+    except (OSError, yaml.YAMLError):
+        return {}
+
+
+TOOL_MATCHES = _load_tool_matches()
+_LEADING_AMOUNT = re.compile(
+    r"^\s*(?:\d|[¼½¾⅓⅔⅛⅜⅝⅞]|\d+\s*/\s*\d+|one\b|two\b|three\b|four\b)",
+    re.I,
+)
+_PROSE_SIGNAL = re.compile(
+    r"\b(?:i|we|you|your|my|our|use|using|used|need|prefer|recommend|"
+    r"note|equipment|make sure|be sure)\b",
+    re.I,
+)
+_NOTE_PREFIX = re.compile(
+    r"^\s*(?:note|equipment|for serving|for garnish|to serve)\s*[:.-]?\s*",
+    re.I,
+)
+_INSTRUCTION_PREFIX = re.compile(
+    r"^\s*(?:add|stir|mix|cook|bake|preheat|let|place|set|see|reserve|keep)\b",
+    re.I,
+)
+
+
+def line_key(raw: Any) -> str:
+    return f"line:{normalize_name(raw)}"
+
+
+def classify_review_line(raw: Any) -> Optional[dict[str, Any]]:
+    """Conservatively identify prose and equipment without deciding for the user."""
+    text = str(raw or "").strip()
+    normalized = normalize_name(text)
+    if not normalized:
+        return None
+    has_amount = bool(_LEADING_AMOUNT.search(text))
+    prose = bool(_PROSE_SIGNAL.search(text))
+    tool_names: list[str] = []
+    for tool_name, phrases in TOOL_MATCHES.items():
+        candidates = [tool_name, *phrases]
+        if any(
+            re.search(rf"(?<!\w){re.escape(normalize_name(phrase))}(?!\w)", normalized)
+            for phrase in candidates
+            if normalize_name(phrase)
+        ):
+            tool_names.append(tool_name)
+    exact_tool = any(
+        normalized.strip(" .:;-")
+        in {normalize_name(name), *(normalize_name(value) for value in TOOL_MATCHES.get(name, []))}
+        for name in tool_names
+    )
+    if tool_names and (exact_tool or prose):
+        return {
+            "raw": text,
+            "normalizedRaw": normalized,
+            "recommendation": "equipment",
+            "toolMatches": tool_names,
+            "reasons": ["matched configured equipment phrase"],
+        }
+    word_count = len(re.findall(r"\b\w+\b", text))
+    sentence_like = (
+        prose
+        or bool(_NOTE_PREFIX.search(text))
+        or (word_count >= 4 and bool(_INSTRUCTION_PREFIX.search(text)))
+        or (word_count >= 8 and bool(re.search(r"[.!?]\s*$", text)))
+    )
+    if not has_amount and sentence_like:
+        return {
+            "raw": text,
+            "normalizedRaw": normalized,
+            "recommendation": "note",
+            "toolMatches": [],
+            "reasons": ["looks like prose rather than a measured ingredient"],
+        }
+    return None
 
 
 def normalize_name(value: Any) -> str:
@@ -199,6 +286,53 @@ class CatalogIndex:
             return result
 
 
+class ToolIndex:
+    """Small normalized index for Mealie recipe tools."""
+
+    def __init__(self) -> None:
+        self.items: list[dict[str, Any]] = []
+        self.by_name: dict[str, dict[str, Any]] = {}
+        self.by_id: dict[str, dict[str, Any]] = {}
+
+    def replace(self, items: Iterable[dict[str, Any]]) -> None:
+        self.items = [
+            copy.deepcopy(item) for item in items if item.get("id") and item.get("name")
+        ]
+        self.by_name = {normalize_name(item["name"]): item for item in self.items}
+        self.by_id = {str(item["id"]): item for item in self.items}
+
+    def upsert(self, item: dict[str, Any]) -> None:
+        if not item.get("id") or not item.get("name"):
+            raise ValueError("Tool requires an id and name")
+        record = copy.deepcopy(item)
+        previous = self.by_id.get(str(record["id"]))
+        if previous:
+            self.items = [
+                record if str(value.get("id")) == str(record["id"]) else value
+                for value in self.items
+            ]
+            self.by_name.pop(normalize_name(previous.get("name")), None)
+        else:
+            self.items.append(record)
+        self.by_id[str(record["id"])] = record
+        self.by_name[normalize_name(record["name"])] = record
+
+    def resolve(self, name: str) -> Optional[dict[str, Any]]:
+        item = self.by_name.get(normalize_name(name))
+        return copy.deepcopy(item) if item else None
+
+    def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+        normalized = normalize_name(query)
+        ranked = sorted(
+            self.items,
+            key=lambda item: (
+                -fuzz.ratio(normalized, normalize_name(item.get("name"))),
+                normalize_name(item.get("name")),
+            ),
+        )
+        return [copy.deepcopy(item) for item in ranked[:limit]]
+
+
 class CatalogApi:
     """Small Mealie API adapter used by parser and review workflows."""
 
@@ -305,6 +439,43 @@ class CatalogApi:
             latest = self._require_success(response, f"add {kind} alias")
         return latest
 
+    def list_tools(self) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            response = self.session.get(
+                f"{self.base_url}/api/organizers/tools",
+                params={"page": page, "perPage": 500},
+                timeout=15,
+            )
+            data = self._require_success(response, "list tools")
+            page_items = data.get("items") or []
+            items.extend(page_items)
+            total_pages = data.get("total_pages") or data.get("totalPages")
+            if not page_items or (total_pages and page >= int(total_pages)) or (
+                not total_pages and len(page_items) < 500
+            ):
+                break
+            page += 1
+        return items
+
+    def create_tool(self, name: str) -> dict[str, Any]:
+        response = self.session.post(
+            f"{self.base_url}/api/organizers/tools", json={"name": name}, timeout=15
+        )
+        if response.status_code == 409:
+            match = next(
+                (
+                    item
+                    for item in self.list_tools()
+                    if normalize_name(item.get("name")) == normalize_name(name)
+                ),
+                None,
+            )
+            if match:
+                return match
+        return self._require_success(response, "create tool")
+
     def get_recipe(self, slug: str) -> dict[str, Any]:
         response = self.session.get(f"{self.base_url}/api/recipes/{slug}", timeout=15)
         return self._require_success(response, "get recipe")
@@ -325,6 +496,7 @@ class PendingCatalogQueue:
             "version": QUEUE_VERSION,
             "recipes": {},
             "resolutions": {},
+            "lineDispositions": {},
             "checkpointSequence": 0,
         }
         self.corrupt_backup: Optional[Path] = None
@@ -337,6 +509,7 @@ class PendingCatalogQueue:
             if loaded.get("version") != QUEUE_VERSION or not isinstance(loaded.get("recipes"), dict):
                 raise ValueError("unsupported or invalid queue schema")
             loaded.setdefault("resolutions", {})
+            loaded.setdefault("lineDispositions", {})
             loaded.setdefault("checkpointSequence", 0)
             self.data = loaded
         except (OSError, ValueError, json.JSONDecodeError):
@@ -396,6 +569,55 @@ class PendingCatalogQueue:
             "pluralName": item.get("pluralName"),
         }
 
+    def line_disposition(self, raw: Any) -> Optional[dict[str, Any]]:
+        disposition = self.data.get("lineDispositions", {}).get(normalize_name(raw))
+        return copy.deepcopy(disposition) if disposition else None
+
+    def set_line_disposition(
+        self, raw: Any, disposition_type: str, tool_name: Optional[str] = None
+    ) -> None:
+        if disposition_type not in ("note", "equipment", "ingredient"):
+            raise ValueError(f"Unsupported line disposition: {disposition_type}")
+        value: dict[str, Any] = {
+            "type": disposition_type,
+            "raw": str(raw or ""),
+            "decidedAt": datetime.now().isoformat(timespec="seconds"),
+        }
+        if disposition_type == "equipment":
+            if not tool_name:
+                raise ValueError("Equipment disposition requires a tool name")
+            value["toolName"] = tool_name
+        self.data.setdefault("lineDispositions", {})[normalize_name(raw)] = value
+
+    def ensure_line_reviews(self) -> None:
+        """Backfill conservative line reviews for existing version-1 queue records."""
+        for recipe in self.recipes.values():
+            reviews = recipe.setdefault("lineReviews", [])
+            existing = {
+                (int(review.get("ingredientIndex", -1)), normalize_name(review.get("raw")))
+                for review in reviews
+            }
+            for ingredient_index, raw_item in enumerate(recipe.get("sourceIngredients", [])):
+                raw = (
+                    raw_item
+                    if isinstance(raw_item, str)
+                    else raw_item.get("note", "") if isinstance(raw_item, dict) else str(raw_item or "")
+                )
+                if self.line_disposition(raw):
+                    continue
+                classification = classify_review_line(raw)
+                marker = (ingredient_index, normalize_name(raw))
+                if classification and marker not in existing:
+                    reviews.append({"ingredientIndex": ingredient_index, **classification})
+                    existing.add(marker)
+
+    def unresolved_line_reviews(self, recipe: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            review
+            for review in recipe.get("lineReviews", [])
+            if not self.line_disposition(review.get("raw", ""))
+        ]
+
     def resolution(
         self, kind: str, source_name: str, index: CatalogIndex
     ) -> tuple[Optional[dict[str, Any]], bool]:
@@ -407,9 +629,67 @@ class PendingCatalogQueue:
         return index.resolve(kind, source_name)
 
     def entries(self, index: CatalogIndex) -> list[dict[str, Any]]:
+        self.ensure_line_reviews()
         grouped: dict[str, dict[str, Any]] = {}
+        hidden_indexes: dict[str, set[int]] = {}
+        for recipe in self.recipes.values():
+            for review in self.unresolved_line_reviews(recipe):
+                raw = review.get("raw", "")
+                key = line_key(raw)
+                entry = grouped.setdefault(
+                    key,
+                    {
+                        "key": key,
+                        "kind": "line",
+                        "name": raw,
+                        "raw": raw,
+                        "recommendation": review.get("recommendation", "note"),
+                        "toolMatches": list(review.get("toolMatches") or []),
+                        "reasons": list(review.get("reasons") or []),
+                        "ambiguous": True,
+                        "occurrences": [],
+                        "catalogEntries": [],
+                    },
+                )
+                for name in review.get("toolMatches") or []:
+                    if name not in entry["toolMatches"]:
+                        entry["toolMatches"].append(name)
+                ingredient_index = int(review.get("ingredientIndex", -1))
+                hidden_indexes.setdefault(recipe["slug"], set()).add(ingredient_index)
+                entry["occurrences"].append(
+                    {
+                        "slug": recipe["slug"],
+                        "ingredientIndex": ingredient_index,
+                        "raw": raw,
+                    }
+                )
         for recipe in self.recipes.values():
             for missing in recipe.get("missing", []):
+                ingredient_index = int(missing.get("ingredientIndex", -1))
+                raw = missing.get("raw", "")
+                disposition = self.line_disposition(raw)
+                if disposition and disposition.get("type") in ("note", "equipment"):
+                    continue
+                if ingredient_index in hidden_indexes.get(recipe["slug"], set()):
+                    line_entry = grouped.get(line_key(raw))
+                    if line_entry is not None:
+                        candidate_key = catalog_key(missing["kind"], missing.get("name", ""))
+                        if not any(
+                            value.get("key") == candidate_key
+                            for value in line_entry["catalogEntries"]
+                        ):
+                            line_entry["catalogEntries"].append(
+                                {
+                                    "key": candidate_key,
+                                    "kind": missing["kind"],
+                                    "name": missing.get("name", ""),
+                                    "proposal": copy.deepcopy(
+                                        missing.get("proposal") or {"name": missing.get("name", "")}
+                                    ),
+                                    "ambiguous": bool(missing.get("ambiguous")),
+                                }
+                            )
+                    continue
                 kind = missing["kind"]
                 name = missing.get("name", "")
                 resolved, _ = self.resolution(kind, name, index)
@@ -435,7 +715,10 @@ class PendingCatalogQueue:
                         "raw": missing.get("raw", ""),
                     }
                 )
-        return sorted(grouped.values(), key=lambda item: (item["kind"], normalize_name(item["name"])))
+        return sorted(
+            grouped.values(),
+            key=lambda item: (0 if item["kind"] == "line" else 1, item["kind"], normalize_name(item["name"])),
+        )
 
 
 class CatalogActionJournal:
@@ -526,7 +809,10 @@ class CatalogActionJournal:
             self._replace_records(records)
 
     def recover(
-        self, queue: PendingCatalogQueue, index: CatalogIndex
+        self,
+        queue: PendingCatalogQueue,
+        index: CatalogIndex,
+        tool_index: Optional[ToolIndex] = None,
     ) -> dict[str, str]:
         checkpoint = int(queue.data.get("checkpointSequence", 0))
         records = [
@@ -553,12 +839,49 @@ class CatalogActionJournal:
                 ),
                 None,
             )
-            source_key = catalog_key(submitted["kind"], submitted["sourceName"])
+            source_key = (
+                line_key(submitted["sourceName"])
+                if submitted.get("kind") == "line"
+                else catalog_key(submitted["kind"], submitted["sourceName"])
+            )
+            if submitted.get("kind") == "line":
+                disposition = (terminal or {}).get("disposition")
+                if terminal and terminal.get("status") == "completed" and disposition:
+                    queue.set_line_disposition(
+                        submitted["sourceName"],
+                        disposition["type"],
+                        disposition.get("toolName"),
+                    )
+                    tool = terminal.get("item")
+                    if tool and tool_index:
+                        tool_index.upsert(tool)
+                    continue
+                if terminal and terminal.get("status") == "failed":
+                    errors[source_key] = str(terminal.get("error") or "Line action failed")
+                    continue
+                if submitted.get("operation") == "create_tool" and tool_index:
+                    tool_name = (submitted.get("disposition") or {}).get("toolName", "")
+                    tool = tool_index.resolve(tool_name)
+                    if tool:
+                        queue.set_line_disposition(
+                            submitted["sourceName"], "equipment", tool_name
+                        )
+                        continue
+                errors[source_key] = "Previous line action had an uncertain outcome; review it again"
+                continue
             if terminal and terminal.get("status") == "completed":
                 item = terminal.get("item") or submitted.get("targetItem")
                 if item and item.get("id") and item.get("name"):
                     index.upsert(submitted["kind"], item)
                     queue.set_resolution(submitted["kind"], submitted["sourceName"], item)
+                    disposition = submitted.get("disposition")
+                    disposition_raw = submitted.get("dispositionRaw")
+                    if disposition and disposition_raw:
+                        queue.set_line_disposition(
+                            disposition_raw,
+                            disposition["type"],
+                            disposition.get("toolName"),
+                        )
                 continue
             if terminal and terminal.get("status") == "failed":
                 errors[source_key] = str(terminal.get("error") or "Catalog action failed")
@@ -584,6 +907,14 @@ class CatalogActionJournal:
                     item = current
             if item:
                 queue.set_resolution(submitted["kind"], submitted["sourceName"], item)
+                disposition = submitted.get("disposition")
+                disposition_raw = submitted.get("dispositionRaw")
+                if disposition and disposition_raw:
+                    queue.set_line_disposition(
+                        disposition_raw,
+                        disposition["type"],
+                        disposition.get("toolName"),
+                    )
             else:
                 errors[source_key] = "Previous catalog action had an uncertain outcome; review it again"
 
@@ -615,6 +946,9 @@ class QueueCheckpointWriter:
         self.queue.data["checkpointSequence"] = sequence
         snapshot = dict(self.base_snapshot)
         snapshot["resolutions"] = copy.deepcopy(self.queue.data.get("resolutions", {}))
+        snapshot["lineDispositions"] = copy.deepcopy(
+            self.queue.data.get("lineDispositions", {})
+        )
         snapshot["checkpointSequence"] = sequence
         with self._lock:
             self.latest_snapshot = (snapshot, sequence)
@@ -676,6 +1010,9 @@ class QueueCheckpointWriter:
         self.queue.data["checkpointSequence"] = sequence
         snapshot = dict(self.base_snapshot)
         snapshot["resolutions"] = copy.deepcopy(self.queue.data.get("resolutions", {}))
+        snapshot["lineDispositions"] = copy.deepcopy(
+            self.queue.data.get("lineDispositions", {})
+        )
         snapshot["checkpointSequence"] = sequence
         self.queue.write_snapshot(snapshot)
         self.journal.compact(sequence)
@@ -692,6 +1029,8 @@ class CatalogAction:
     reserved_keys: tuple[str, ...]
     proposal: Optional[dict[str, Any]] = None
     target_item: Optional[dict[str, Any]] = None
+    disposition: Optional[dict[str, Any]] = None
+    disposition_raw: Optional[str] = None
 
 
 @dataclass
@@ -700,6 +1039,7 @@ class CatalogActionResult:
     item: Optional[dict[str, Any]] = None
     error: Optional[str] = None
     refreshed_items: Optional[list[dict[str, Any]]] = None
+    disposition: Optional[dict[str, Any]] = None
 
 
 class CatalogActionRunner:
@@ -731,12 +1071,19 @@ class CatalogActionRunner:
             reservedKeys=list(action.reserved_keys),
             proposal=action.proposal,
             targetItem=action.target_item,
+            disposition=action.disposition,
+            dispositionRaw=action.disposition_raw,
         )
         with self._lock:
             self._pending += 1
         self.executor.submit(self._run, action)
 
-    def complete_local(self, action: CatalogAction, item: dict[str, Any]) -> CatalogActionResult:
+    def complete_local(
+        self,
+        action: CatalogAction,
+        item: Optional[dict[str, Any]] = None,
+        disposition: Optional[dict[str, Any]] = None,
+    ) -> CatalogActionResult:
         self.journal.append(
             "submitted",
             actionId=action.action_id,
@@ -746,11 +1093,20 @@ class CatalogActionRunner:
             reservedKeys=list(action.reserved_keys),
             proposal=action.proposal,
             targetItem=action.target_item,
+            disposition=action.disposition,
+            dispositionRaw=action.disposition_raw,
         )
         self.journal.append(
-            "completed", actionId=action.action_id, item=copy.deepcopy(item)
+            "completed",
+            actionId=action.action_id,
+            item=copy.deepcopy(item),
+            disposition=copy.deepcopy(disposition or action.disposition),
         )
-        return CatalogActionResult(action=action, item=copy.deepcopy(item))
+        return CatalogActionResult(
+            action=action,
+            item=copy.deepcopy(item),
+            disposition=copy.deepcopy(disposition or action.disposition),
+        )
 
     def _run(self, action: CatalogAction) -> None:
         try:
@@ -762,17 +1118,59 @@ class CatalogActionRunner:
                 item = self.api.add_alias(
                     action.kind, action.target_item["id"], action.source_name
                 )
+            elif action.operation == "create_tool":
+                tool_name = (action.disposition or {}).get("toolName")
+                if not tool_name:
+                    raise RuntimeError("Tool creation name is missing")
+                item = self.api.create_tool(tool_name)
             else:
                 raise RuntimeError(f"Unsupported background operation: {action.operation}")
             self.journal.append(
-                "completed", actionId=action.action_id, item=copy.deepcopy(item)
+                "completed",
+                actionId=action.action_id,
+                item=copy.deepcopy(item),
+                disposition=copy.deepcopy(action.disposition),
             )
-            self.results.put(CatalogActionResult(action=action, item=item))
+            self.results.put(
+                CatalogActionResult(
+                    action=action,
+                    item=item,
+                    disposition=copy.deepcopy(action.disposition),
+                )
+            )
         except Exception as exc:
+            if action.operation == "create_tool":
+                try:
+                    tool_name = (action.disposition or {}).get("toolName", "")
+                    item = next(
+                        (
+                            tool
+                            for tool in self.api.list_tools()
+                            if normalize_name(tool.get("name")) == normalize_name(tool_name)
+                        ),
+                        None,
+                    )
+                    if item:
+                        self.journal.append(
+                            "completed",
+                            actionId=action.action_id,
+                            item=copy.deepcopy(item),
+                            disposition=copy.deepcopy(action.disposition),
+                        )
+                        self.results.put(
+                            CatalogActionResult(
+                                action=action,
+                                item=item,
+                                disposition=copy.deepcopy(action.disposition),
+                            )
+                        )
+                        return
+                except Exception:
+                    pass
             refreshed_items: Optional[list[dict[str, Any]]] = None
             try:
                 list_items = getattr(self.api, "list_items", None)
-                if callable(list_items):
+                if callable(list_items) and action.kind in CATALOG_KINDS:
                     refreshed_items = list_items(action.kind)
             except Exception:
                 refreshed_items = None
@@ -838,13 +1236,42 @@ def replay_ready_recipes(
     api: CatalogApi,
     history: set[str],
     logger: Optional[Callable[[str], None]] = None,
+    tool_index: Optional[ToolIndex] = None,
 ) -> dict[str, int]:
     """Apply stored proposals for recipes whose references are now all resolved."""
     stats = {"updated": 0, "waiting": 0, "stale": 0, "failed": 0}
+    queue.ensure_line_reviews()
     for slug, record in list(queue.recipes.items()):
         resolved_by_key: dict[str, dict[str, Any]] = {}
         blocked = False
+        if queue.unresolved_line_reviews(record):
+            stats["waiting"] += 1
+            continue
+        equipment_by_index: dict[int, dict[str, Any]] = {}
+        dispositions_by_index: dict[int, dict[str, Any]] = {}
+        for ingredient_index, raw_item in enumerate(record.get("sourceIngredients", [])):
+            raw = (
+                raw_item
+                if isinstance(raw_item, str)
+                else raw_item.get("note", "") if isinstance(raw_item, dict) else str(raw_item or "")
+            )
+            disposition = queue.line_disposition(raw)
+            if not disposition:
+                continue
+            dispositions_by_index[ingredient_index] = disposition
+            if disposition.get("type") == "equipment":
+                tool = tool_index.resolve(disposition.get("toolName", "")) if tool_index else None
+                if not tool:
+                    blocked = True
+                    break
+                equipment_by_index[ingredient_index] = tool
+        if blocked:
+            stats["waiting"] += 1
+            continue
         for missing in record.get("missing", []):
+            disposition = dispositions_by_index.get(int(missing.get("ingredientIndex", -1)))
+            if disposition and disposition.get("type") in ("note", "equipment"):
+                continue
             item, ambiguous = queue.resolution(missing["kind"], missing.get("name", ""), index)
             if not item or ambiguous:
                 blocked = True
@@ -865,10 +1292,33 @@ def replay_ready_recipes(
                 continue
 
             proposed = copy.deepcopy(record.get("proposedIngredients", []))
+            for ingredient_index, disposition in dispositions_by_index.items():
+                if disposition.get("type") in ("note", "equipment"):
+                    raw = record.get("sourceIngredients", [])[ingredient_index]
+                    raw_text = (
+                        raw if isinstance(raw, str) else raw.get("note", "") if isinstance(raw, dict) else str(raw or "")
+                    )
+                    proposed[ingredient_index] = {
+                        "note": raw_text,
+                        "originalText": raw_text,
+                    }
             for missing in record.get("missing", []):
+                disposition = dispositions_by_index.get(int(missing.get("ingredientIndex", -1)))
+                if disposition and disposition.get("type") in ("note", "equipment"):
+                    continue
                 replacement = resolved_by_key[catalog_key(missing["kind"], missing.get("name", ""))]
                 proposed[missing["ingredientIndex"]][missing["kind"]] = item_reference(replacement)
             current["recipeIngredient"] = proposed
+            desired_tools = list(current.get("tools") or [])
+            known_tool_ids = {str(tool.get("id")) for tool in desired_tools if tool.get("id")}
+            known_tool_names = {normalize_name(tool.get("name")) for tool in desired_tools}
+            for tool in equipment_by_index.values():
+                if str(tool.get("id")) not in known_tool_ids and normalize_name(tool.get("name")) not in known_tool_names:
+                    desired_tools.append(copy.deepcopy(tool))
+                    known_tool_ids.add(str(tool.get("id")))
+                    known_tool_names.add(normalize_name(tool.get("name")))
+            if equipment_by_index:
+                current["tools"] = desired_tools
             api.update_recipe(slug, current)
             queue.remove_recipe(slug)
             history.add(slug)
@@ -889,6 +1339,7 @@ class CatalogReviewer:
     index: CatalogIndex
     api: CatalogApi
     console: Console
+    tool_index: ToolIndex = field(default_factory=ToolIndex)
 
     def create(self, entry: dict[str, Any], proposal: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         proposal = copy.deepcopy(proposal or entry["proposal"])
@@ -999,9 +1450,8 @@ class CatalogReviewer:
         pending: int = 0,
         error: Optional[str] = None,
     ) -> None:
-        self.console.rule(
-            f"[bold cyan]{entry['kind'].title()}: {escape(str(entry['name']))}[/bold cyan]"
-        )
+        title = "Line classification" if entry["kind"] == "line" else entry["kind"].title()
+        self.console.rule(f"[bold cyan]{title}: {escape(str(entry['name']))}[/bold cyan]")
         status = f"{remaining} unresolved item(s) remain"
         if skipped:
             status += f"; {skipped} skipped this session"
@@ -1010,6 +1460,34 @@ class CatalogReviewer:
         self.console.print(status, markup=False)
         if error:
             self.console.print(f"[error]Previous action failed: {escape(error)}[/error]")
+        if entry["kind"] == "line":
+            recommendation = entry.get("recommendation", "note")
+            if recommendation == "equipment":
+                tools = ", ".join(entry.get("toolMatches") or []) or "equipment"
+                self.console.print(
+                    f"[warning]Manual classification required: likely equipment ({escape(tools)}).[/warning]"
+                )
+            else:
+                self.console.print(
+                    "[warning]Manual classification required: likely an ingredient note.[/warning]"
+                )
+            for reason in entry.get("reasons") or []:
+                self.console.print(f"  Reason: {reason}", markup=False)
+            catalog_entries = entry.get("catalogEntries") or []
+            if catalog_entries:
+                candidate = catalog_entries[0]
+                self.console.print(
+                    f"Parser proposed this {candidate['kind']} if you confirm it is an ingredient:",
+                    style="bold",
+                )
+                for field_name, value in self._proposal_fields(candidate):
+                    self.console.print(f"  {field_name}: {value}", markup=False)
+            self.console.print(
+                f"Used by [cyan]{len(entry['occurrences'])}[/cyan] recipe ingredient(s)"
+            )
+            for example in self._usage_examples(entry):
+                self.console.print(f"  • {example}", markup=False)
+            return
         self.console.print(f"Create would submit this {entry['kind']}:", style="bold")
         for field, value in self._proposal_fields(entry):
             self.console.print(f"  {field}: {value}", markup=False)
@@ -1040,6 +1518,27 @@ class CatalogReviewer:
         )
         self.console.print("7) Quit", markup=False)
 
+    def _show_line_actions(self, entry: dict[str, Any]) -> None:
+        recommendation = entry.get("recommendation", "note")
+        tool_name = (entry.get("toolMatches") or ["selected equipment"])[0]
+        if recommendation == "equipment":
+            self.console.print(
+                f"1) Add {tool_name!r} as equipment and keep this line as a note (recommended)",
+                markup=False,
+            )
+            self.console.print("2) Keep this line as a note only", markup=False)
+        else:
+            self.console.print("1) Keep this line as a note (recommended)", markup=False)
+            self.console.print("2) Choose equipment and keep this line as a note", markup=False)
+        self.console.print("3) Create the proposed catalog item", markup=False)
+        self.console.print("4) Edit details, then create", markup=False)
+        self.console.print("5) Map to an existing item and save an alias", markup=False)
+        self.console.print("6) Map to an existing item for this review queue only", markup=False)
+        self.console.print("7) Confirm this is an ingredient and continue normal review", markup=False)
+        self.console.print("8) Skip for now", markup=False)
+        self.console.print("9) Review all eligible proposals, then optionally accept all", markup=False)
+        self.console.print("10) Quit", markup=False)
+
     def _bulk_table(self, entries: list[dict[str, Any]]) -> None:
         table = Table(title="Review proposed catalog items")
         table.add_column("Type")
@@ -1050,6 +1549,17 @@ class CatalogReviewer:
         table.add_column("Closest existing")
         table.add_column("Status")
         for entry in entries:
+            if entry.get("kind") == "line":
+                table.add_row(
+                    "line",
+                    escape(str(entry.get("name") or "")),
+                    "—",
+                    str(len(entry.get("occurrences") or [])),
+                    escape("\n".join(self._usage_examples(entry))),
+                    "—",
+                    "Manual classification required",
+                )
+                continue
             fields = self._proposal_fields(entry)
             details = ", ".join(f"{field}={value}" for field, value in fields if field != "name")
             suggestions = self.index.search(entry["kind"], entry["name"], limit=5)
@@ -1080,6 +1590,104 @@ class CatalogReviewer:
             )
         return [str(name) for name in names if name]
 
+    def _rebuild_entries(self, entries_by_key: dict[str, dict[str, Any]]) -> None:
+        entries_by_key.clear()
+        entries_by_key.update(
+            {entry["key"]: entry for entry in self.queue.entries(self.index)}
+        )
+
+    def _line_action(
+        self, entry: dict[str, Any], disposition: dict[str, Any], operation: str
+    ) -> CatalogAction:
+        return CatalogAction(
+            action_id=str(uuid.uuid4()),
+            operation=operation,
+            kind="line",
+            source_name=entry["raw"],
+            source_key=entry["key"],
+            reserved_keys=(entry["key"],),
+            disposition=copy.deepcopy(disposition),
+        )
+
+    def _complete_line_locally(
+        self,
+        entry: dict[str, Any],
+        disposition: dict[str, Any],
+        runner: CatalogActionRunner,
+    ) -> CatalogActionResult:
+        action = self._line_action(
+            entry, disposition, f"classify_{disposition['type']}"
+        )
+        return runner.complete_local(action, disposition=disposition)
+
+    def _choose_tool_name(self, entry: dict[str, Any]) -> Optional[str]:
+        configured = list(entry.get("toolMatches") or [])
+        candidates: list[tuple[str, Optional[dict[str, Any]]]] = []
+        for name in configured:
+            candidates.append((name, self.tool_index.resolve(name)))
+        for item in self.tool_index.search(entry.get("raw", ""), limit=5):
+            if normalize_name(item["name"]) not in {normalize_name(name) for name, _ in candidates}:
+                candidates.append((item["name"], item))
+        while True:
+            table = Table(title="Equipment choices")
+            table.add_column("#", justify="right")
+            table.add_column("Tool")
+            table.add_column("Status")
+            for number, (name, item) in enumerate(candidates, 1):
+                table.add_row(str(number), name, "Exists" if item else "Would be created")
+            self.console.print(table)
+            search_choice = len(candidates) + 1
+            cancel_choice = len(candidates) + 2
+            self.console.print(f"{search_choice}) Search or enter another tool", markup=False)
+            self.console.print(f"{cancel_choice}) Cancel", markup=False)
+            choice = Prompt.ask(
+                "Choose equipment",
+                choices=[str(value) for value in range(1, cancel_choice + 1)],
+                default="1" if candidates else str(cancel_choice),
+                console=self.console,
+            )
+            selected = int(choice)
+            if selected <= len(candidates):
+                return candidates[selected - 1][0]
+            if selected == cancel_choice:
+                return None
+            query = Prompt.ask("Search tools", console=self.console).strip()
+            if not query:
+                continue
+            results = self.tool_index.search(query, limit=10)
+            candidates = [(item["name"], item) for item in results]
+            if not any(normalize_name(name) == normalize_name(query) for name, _ in candidates):
+                candidates.append((query, None))
+
+    def _start_equipment_action(
+        self,
+        entry: dict[str, Any],
+        tool_name: str,
+        pending_by_key: dict[str, str],
+        runner: CatalogActionRunner,
+    ) -> Optional[CatalogActionResult]:
+        disposition = {"type": "equipment", "toolName": tool_name}
+        existing = self.tool_index.resolve(tool_name)
+        action = self._line_action(
+            entry,
+            disposition,
+            "classify_equipment" if existing else "create_tool",
+        )
+        pending_by_key[entry["key"]] = action.action_id
+        if existing:
+            return runner.complete_local(action, existing, disposition)
+        if not Confirm.ask(
+            f"Create the Mealie tool {tool_name!r}, attach it to matching recipes, "
+            "and keep the original line as a note?",
+            default=False,
+            console=self.console,
+        ):
+            pending_by_key.pop(entry["key"], None)
+            self.console.print("Equipment creation cancelled; nothing was changed.")
+            return None
+        runner.submit(action)
+        return None
+
     def _new_action(
         self,
         operation: str,
@@ -1088,8 +1696,12 @@ class CatalogReviewer:
         *,
         proposal: Optional[dict[str, Any]] = None,
         target_item: Optional[dict[str, Any]] = None,
+        disposition: Optional[dict[str, Any]] = None,
+        disposition_raw: Optional[str] = None,
     ) -> CatalogAction:
         reserved = {entry["key"]}
+        if disposition_raw:
+            reserved.add(line_key(disposition_raw))
         if operation == "create" and proposal:
             reserved.update(
                 key
@@ -1108,6 +1720,8 @@ class CatalogReviewer:
             reserved_keys=tuple(sorted(reserved)),
             proposal=copy.deepcopy(proposal),
             target_item=copy.deepcopy(target_item),
+            disposition=copy.deepcopy(disposition),
+            disposition_raw=disposition_raw,
         )
 
     def _start_create(
@@ -1117,12 +1731,20 @@ class CatalogReviewer:
         entries_by_key: dict[str, dict[str, Any]],
         pending_by_key: dict[str, str],
         runner: CatalogActionRunner,
+        *,
+        disposition: Optional[dict[str, Any]] = None,
+        disposition_raw: Optional[str] = None,
     ) -> Optional[CatalogActionResult]:
         existing, ambiguous = self.index.resolve(entry["kind"], proposal.get("name", ""))
         if ambiguous:
             raise RuntimeError("Catalog name or alias is ambiguous; edit the proposal or map it explicitly")
         action = self._new_action(
-            "create", entry, entries_by_key, proposal=proposal
+            "create",
+            entry,
+            entries_by_key,
+            proposal=proposal,
+            disposition=disposition,
+            disposition_raw=disposition_raw,
         )
         if any(key in pending_by_key for key in action.reserved_keys):
             return None
@@ -1148,19 +1770,49 @@ class CatalogReviewer:
         for key in action.reserved_keys:
             if pending_by_key.get(key) == action.action_id:
                 pending_by_key.pop(key, None)
-        checkpoint.note_completion()
         if result.error:
             if result.refreshed_items is not None:
                 self.index.replace(action.kind, result.refreshed_items)
             errors[action.source_key] = result.error
+            if action.disposition_raw:
+                errors[line_key(action.disposition_raw)] = result.error
             self.console.print(
                 f"[error]{escape(action.source_name)!r} failed and returned to review: "
                 f"{escape(result.error)}[/error]"
             )
+            checkpoint.note_completion()
             return 1
+
+        if action.kind == "line":
+            disposition = result.disposition or action.disposition
+            if not disposition:
+                errors[action.source_key] = "Line action returned no disposition"
+                checkpoint.note_completion()
+                return 1
+            if disposition.get("type") == "equipment" and result.item:
+                self.tool_index.upsert(result.item)
+            self.queue.set_line_disposition(
+                action.source_name,
+                disposition["type"],
+                disposition.get("toolName"),
+            )
+            errors.pop(action.source_key, None)
+            deferred.discard(action.source_key)
+            self._rebuild_entries(entries_by_key)
+            checkpoint.note_completion()
+            label = {
+                "note": "Kept as ingredient note",
+                "equipment": f"Added equipment {disposition.get('toolName')!r} and kept as note",
+                "ingredient": "Confirmed as ingredient",
+            }[disposition["type"]]
+            self.console.print(f"[success]{label}: {escape(action.source_name)}[/success]")
+            return 0
 
         if not result.item:
             errors[action.source_key] = "Catalog action returned no item"
+            if action.disposition_raw:
+                errors[line_key(action.disposition_raw)] = "Catalog action returned no item"
+            checkpoint.note_completion()
             return 1
         self.index.upsert(action.kind, result.item)
         self.queue.set_resolution(action.kind, action.source_name, result.item)
@@ -1174,6 +1826,8 @@ class CatalogReviewer:
         for key in candidates:
             entry = entries_by_key.get(key)
             if not entry:
+                continue
+            if entry.get("kind") == "line":
                 continue
             item, ambiguous = self.queue.resolution(entry["kind"], entry["name"], self.index)
             if item and not ambiguous:
@@ -1197,6 +1851,16 @@ class CatalogReviewer:
                 f"Also resolved {len(resolved)} queued item(s): " + ", ".join(resolved),
                 markup=False,
             )
+        if action.disposition and action.disposition_raw:
+            self.queue.set_line_disposition(
+                action.disposition_raw,
+                action.disposition["type"],
+                action.disposition.get("toolName"),
+            )
+            errors.pop(line_key(action.disposition_raw), None)
+            deferred.discard(line_key(action.disposition_raw))
+            self._rebuild_entries(entries_by_key)
+        checkpoint.note_completion()
         return 0
 
     def _queue_bulk(
@@ -1287,10 +1951,20 @@ class CatalogReviewer:
         return proposal
 
     def review(self) -> int:
+        self.queue.ensure_line_reviews()
+        list_tools = getattr(self.api, "list_tools", None)
+        if callable(list_tools):
+            try:
+                self.tool_index.replace(list_tools())
+            except Exception as exc:
+                self.console.print(
+                    f"[warning]Could not load Mealie tools; equipment choices may need retrying: "
+                    f"{escape(str(exc))}[/warning]"
+                )
         journal = CatalogActionJournal(
             self.queue.path, int(self.queue.data.get("checkpointSequence", 0))
         )
-        recovery_errors = journal.recover(self.queue, self.index)
+        recovery_errors = journal.recover(self.queue, self.index, self.tool_index)
         if journal.corrupt_backup:
             self.console.print(
                 f"[warning]A corrupt catalog action journal was preserved at "
@@ -1338,7 +2012,13 @@ class CatalogReviewer:
                     for key, entry in entries_by_key.items()
                     if key not in deferred and key not in pending_by_key
                 ]
-                active.sort(key=lambda item: (item["kind"], normalize_name(item["name"])))
+                active.sort(
+                    key=lambda item: (
+                        0 if item["kind"] == "line" else 1,
+                        item["kind"],
+                        normalize_name(item["name"]),
+                    )
+                )
                 if not active:
                     if runner.pending_count:
                         result = runner.wait_for_result(timeout=0.1)
@@ -1358,7 +2038,9 @@ class CatalogReviewer:
                     break
 
                 entry = active[0]
-                prefetcher.prefetch(active[1:21])
+                prefetcher.prefetch(
+                    [item for item in active[1:21] if item["kind"] in CATALOG_KINDS]
+                )
                 self._show_entry(
                     entry,
                     len(entries_by_key),
@@ -1366,14 +2048,106 @@ class CatalogReviewer:
                     runner.pending_count,
                     errors.get(entry["key"]),
                 )
-                self._show_actions()
-                action_choice = Prompt.ask(
-                    "Choose an action",
-                    choices=["1", "2", "3", "4", "5", "6", "7"],
-                    default="5",
-                    console=self.console,
-                )
+                if entry["kind"] == "line":
+                    self._show_line_actions(entry)
+                    action_choice = Prompt.ask(
+                        "Choose an action",
+                        choices=[str(value) for value in range(1, 11)],
+                        default="8",
+                        console=self.console,
+                    )
+                else:
+                    self._show_actions()
+                    action_choice = Prompt.ask(
+                        "Choose an action",
+                        choices=["1", "2", "3", "4", "5", "6", "7"],
+                        default="5",
+                        console=self.console,
+                    )
+                catalog_disposition: Optional[dict[str, Any]] = None
+                catalog_disposition_raw: Optional[str] = None
                 try:
+                    if entry["kind"] == "line":
+                        if action_choice == "10":
+                            quitting = True
+                            break
+                        if action_choice == "8":
+                            deferred.add(entry["key"])
+                            continue
+                        if action_choice == "9":
+                            failures += self._queue_bulk(
+                                entries_by_key,
+                                deferred,
+                                pending_by_key,
+                                errors,
+                                runner,
+                                checkpoint,
+                            )
+                            continue
+                        if action_choice == "1":
+                            if entry.get("recommendation") == "equipment":
+                                matches = entry.get("toolMatches") or []
+                                tool_name = (
+                                    matches[0]
+                                    if len(matches) == 1
+                                    else self._choose_tool_name(entry)
+                                )
+                                if tool_name:
+                                    result = self._start_equipment_action(
+                                        entry, tool_name, pending_by_key, runner
+                                    )
+                                    if result:
+                                        apply_results([result])
+                            else:
+                                apply_results(
+                                    [
+                                        self._complete_line_locally(
+                                            entry, {"type": "note"}, runner
+                                        )
+                                    ]
+                                )
+                            continue
+                        if action_choice == "2":
+                            if entry.get("recommendation") == "equipment":
+                                apply_results(
+                                    [
+                                        self._complete_line_locally(
+                                            entry, {"type": "note"}, runner
+                                        )
+                                    ]
+                                )
+                            else:
+                                tool_name = self._choose_tool_name(entry)
+                                if tool_name:
+                                    result = self._start_equipment_action(
+                                        entry, tool_name, pending_by_key, runner
+                                    )
+                                    if result:
+                                        apply_results([result])
+                            continue
+                        if action_choice == "7":
+                            apply_results(
+                                [
+                                    self._complete_line_locally(
+                                        entry, {"type": "ingredient"}, runner
+                                    )
+                                ]
+                            )
+                            continue
+                        catalog_entries = entry.get("catalogEntries") or []
+                        if not catalog_entries:
+                            self.console.print(
+                                "[warning]The parser did not leave a missing catalog proposal for this line. "
+                                "Choose 7 to confirm it as an ingredient.[/warning]"
+                            )
+                            continue
+                        raw_line = entry["raw"]
+                        occurrences = copy.deepcopy(entry.get("occurrences") or [])
+                        entry = copy.deepcopy(catalog_entries[0])
+                        entry["occurrences"] = occurrences
+                        catalog_disposition = {"type": "ingredient"}
+                        catalog_disposition_raw = raw_line
+                        action_choice = str(int(action_choice) - 2)
                     if action_choice == "7":
                         quitting = True
                         break
@@ -1393,6 +2167,8 @@ class CatalogReviewer:
                             entries_by_key,
                             pending_by_key,
                             runner,
+                            disposition=catalog_disposition,
+                            disposition_raw=catalog_disposition_raw,
                         )
                         if local_result:
                             apply_results([local_result])
@@ -1417,13 +2193,17 @@ class CatalogReviewer:
                             entry,
                             entries_by_key,
                             target_item=selected,
+                            disposition=catalog_disposition,
+                            disposition_raw=catalog_disposition_raw,
                         )
                         errors.pop(entry["key"], None)
                         if operation == "map_alias":
                             runner.submit(catalog_action)
-                            pending_by_key[entry["key"]] = catalog_action.action_id
+                            for key in catalog_action.reserved_keys:
+                                pending_by_key[key] = catalog_action.action_id
                         else:
-                            pending_by_key[entry["key"]] = catalog_action.action_id
+                            for key in catalog_action.reserved_keys:
+                                pending_by_key[key] = catalog_action.action_id
                             apply_results(
                                 [runner.complete_local(catalog_action, selected)]
                             )

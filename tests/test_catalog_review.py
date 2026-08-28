@@ -17,6 +17,8 @@ from kitchen_ops_catalog import (
     CatalogReviewer,
     PendingCatalogQueue,
     QueueCheckpointWriter,
+    ToolIndex,
+    classify_review_line,
     replay_ready_recipes,
 )
 
@@ -49,6 +51,8 @@ class FakeApi:
         self.aliases = []
         self.recipes = {}
         self.updated_recipes = []
+        self.tools = [{"id": "tool-air-fryer", "name": "Air Fryer", "slug": "air-fryer"}]
+        self.created_tools = []
 
     def refresh(self, index, kind=None):
         for current in ((kind,) if kind else ("food", "unit")):
@@ -75,6 +79,25 @@ class FakeApi:
         self.recipes[slug] = copy.deepcopy(payload)
         self.updated_recipes.append(slug)
         return copy.deepcopy(payload)
+
+    def list_tools(self):
+        return copy.deepcopy(self.tools)
+
+    def create_tool(self, name):
+        existing = next(
+            (tool for tool in self.tools if tool["name"].casefold() == name.casefold()),
+            None,
+        )
+        if existing:
+            return copy.deepcopy(existing)
+        tool = {
+            "id": f"tool-new-{len(self.created_tools)}",
+            "name": name,
+            "slug": name.casefold().replace(" ", "-"),
+        }
+        self.tools.append(tool)
+        self.created_tools.append(name)
+        return copy.deepcopy(tool)
 
 
 def blocked_record(slug="recipe-one", food="drinking chocolate", unit=None):
@@ -108,6 +131,46 @@ def blocked_record(slug="recipe-one", food="drinking chocolate", unit=None):
         "proposedIngredients": proposed,
         "missing": missing,
     }
+
+
+def flagged_record(
+    slug="air-fryer-recipe",
+    raw="Air Fryer. I use the Breville Smart Oven Air",
+    food="Air Fryer. I use the Breville Smart Oven Air",
+):
+    record = blocked_record(slug, food=food)
+    record["sourceIngredients"] = [raw]
+    record["proposedIngredients"][0]["food"]["name"] = food
+    record["missing"][0]["raw"] = raw
+    return record
+
+
+class LineDetectionTests(unittest.TestCase):
+    def test_air_fryer_prose_is_equipment(self):
+        result = classify_review_line("Air Fryer. I use the Breville Smart Oven Air")
+
+        self.assertEqual(result["recommendation"], "equipment")
+        self.assertEqual(result["toolMatches"], ["Air Fryer"])
+
+    def test_note_prose_is_flagged_but_normal_ingredients_are_not(self):
+        self.assertEqual(
+            classify_review_line("I prefer to make this a day ahead.")["recommendation"],
+            "note",
+        )
+        self.assertIsNone(classify_review_line("1 skillet steak"))
+        self.assertIsNone(classify_review_line("skillet steak"))
+        self.assertIsNone(classify_review_line("parsley for serving"))
+        self.assertIsNone(classify_review_line("salt and pepper, to taste."))
+        self.assertIsNone(classify_review_line("1 cup sugar"))
+        self.assertEqual(
+            classify_review_line("Let rest before slicing.")["recommendation"], "note"
+        )
+
+    def test_multiple_equipment_matches_are_preserved_for_numbered_choice(self):
+        result = classify_review_line("Use the wok on the grill.")
+
+        self.assertEqual(result["recommendation"], "equipment")
+        self.assertEqual(set(result["toolMatches"]), {"Wok", "Smoker / Grill"})
 
 
 class CatalogIndexTests(unittest.TestCase):
@@ -193,6 +256,137 @@ class QueueAndReviewTests(unittest.TestCase):
         entries = loaded.entries(self.index)
         self.assertEqual(len(entries), 1)
         self.assertEqual(len(entries[0]["occurrences"]), 2)
+
+    def test_existing_queue_backfills_line_review_and_hides_food_proposal(self):
+        self.queue.upsert_recipe(flagged_record())
+
+        entries = self.queue.entries(self.index)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["kind"], "line")
+        self.assertEqual(entries[0]["recommendation"], "equipment")
+        self.assertEqual(entries[0]["catalogEntries"][0]["kind"], "food")
+
+    def test_note_disposition_applies_to_identical_raw_text_only(self):
+        self.queue.upsert_recipe(flagged_record("one"))
+        self.queue.upsert_recipe(flagged_record("two"))
+        self.queue.upsert_recipe(
+            flagged_record("three", raw="Air Fryer: use the countertop model")
+        )
+        self.queue.set_line_disposition(
+            "Air Fryer. I use the Breville Smart Oven Air", "note"
+        )
+
+        entries = self.queue.entries(self.index)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["name"], "Air Fryer: use the countertop model")
+
+    def test_flagged_line_defaults_to_skip_and_uses_context_menu(self):
+        self.queue.upsert_recipe(flagged_record())
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["8"]):
+            reviewer.review()
+
+        self.assertIsNone(
+            self.queue.line_disposition("Air Fryer. I use the Breville Smart Oven Air")
+        )
+
+    def test_accepting_equipment_uses_existing_tool_and_persists_disposition(self):
+        raw = "Air Fryer. I use the Breville Smart Oven Air"
+        self.queue.upsert_recipe(flagged_record(raw=raw))
+        tools = ToolIndex()
+        tools.replace(self.api.list_tools())
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console, tools)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", return_value="1"):
+            reviewer.review()
+
+        disposition = self.queue.line_disposition(raw)
+        self.assertEqual(disposition["type"], "equipment")
+        self.assertEqual(disposition["toolName"], "Air Fryer")
+        self.assertEqual(self.api.created_tools, [])
+        loaded = PendingCatalogQueue(self.path).load()
+        self.assertEqual(loaded.line_disposition(raw)["toolName"], "Air Fryer")
+
+    def test_missing_equipment_tool_requires_confirmation_before_background_create(self):
+        raw = "Wok. I use a carbon steel model."
+        self.queue.upsert_recipe(flagged_record(raw=raw, food=raw))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", return_value="1"), patch(
+            "kitchen_ops_catalog.Confirm.ask", return_value=True
+        ) as confirm:
+            reviewer.review()
+
+        self.assertEqual(self.api.created_tools, ["Wok"])
+        self.assertEqual(self.queue.line_disposition(raw)["toolName"], "Wok")
+        self.assertFalse(confirm.call_args.kwargs["default"])
+
+    def test_confirming_flagged_line_as_ingredient_reveals_catalog_proposal(self):
+        raw = "Air Fryer. I use the Breville Smart Oven Air"
+        self.queue.upsert_recipe(flagged_record(raw=raw))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["7", "5"]):
+            reviewer.review()
+
+        self.assertEqual(self.queue.line_disposition(raw)["type"], "ingredient")
+        entries = self.queue.entries(self.index)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["kind"], "food")
+
+    def test_cancelling_flagged_alias_mapping_does_not_classify_the_line(self):
+        raw = "Air Fryer. I use the Breville Smart Oven Air"
+        self.queue.upsert_recipe(flagged_record(raw=raw, food="air fryer food"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch(
+            "kitchen_ops_catalog.Prompt.ask", side_effect=["5", "1", "8"]
+        ), patch("kitchen_ops_catalog.Confirm.ask", return_value=False):
+            reviewer.review()
+
+        self.assertIsNone(self.queue.line_disposition(raw))
+
+    def test_failed_flagged_create_does_not_classify_the_line(self):
+        raw = "Air Fryer. I use the Breville Smart Oven Air"
+        self.queue.upsert_recipe(flagged_record(raw=raw))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["3", "10"]), patch.object(
+            self.api, "create_item", side_effect=RuntimeError("API unavailable")
+        ):
+            reviewer.review()
+
+        self.assertIsNone(self.queue.line_disposition(raw))
+
+    def test_successful_flagged_create_commits_ingredient_classification(self):
+        raw = "Air Fryer. I use the Breville Smart Oven Air"
+        self.queue.upsert_recipe(flagged_record(raw=raw))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", return_value="3"):
+            reviewer.review()
+
+        self.assertEqual(self.queue.line_disposition(raw)["type"], "ingredient")
+        self.assertEqual(len(self.api.created), 1)
+
+    def test_bulk_review_excludes_flagged_lines(self):
+        raw = "Air Fryer. I use the Breville Smart Oven Air"
+        self.queue.upsert_recipe(flagged_record(raw=raw))
+        self.queue.upsert_recipe(blocked_record("ordinary", food="malted cocoa"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["9", "10"]), patch(
+            "kitchen_ops_catalog.Confirm.ask", return_value=True
+        ):
+            reviewer.review()
+
+        self.assertEqual([proposal[1]["name"] for proposal in self.api.created], ["malted cocoa"])
+        self.assertIsNone(self.queue.line_disposition(raw))
+        self.console.file.flush()
+        self.assertIn("Manual classification required", self.console_path.read_text())
 
     def test_create_and_map_with_alias_persist_resolutions(self):
         self.queue.upsert_recipe(blocked_record())
@@ -638,6 +832,74 @@ class CatalogJournalTests(unittest.TestCase):
         checkpointed = PendingCatalogQueue(self.path).load()
         self.assertEqual(checkpointed.data["checkpointSequence"], 2)
 
+    def test_completed_line_disposition_replays_after_crash(self):
+        raw = "I prefer to make this a day ahead."
+        journal = CatalogActionJournal(self.path)
+        journal.append(
+            "submitted",
+            actionId="line-action",
+            operation="classify_note",
+            kind="line",
+            sourceName=raw,
+            reservedKeys=[f"line:{raw.casefold()}"],
+            disposition={"type": "note"},
+        )
+        journal.append(
+            "completed",
+            actionId="line-action",
+            disposition={"type": "note"},
+        )
+        loaded = PendingCatalogQueue(self.path).load()
+
+        errors = journal.recover(loaded, self.index, ToolIndex())
+
+        self.assertEqual(errors, {})
+        self.assertEqual(loaded.line_disposition(raw)["type"], "note")
+
+    def test_completed_flagged_catalog_action_commits_ingredient_disposition(self):
+        raw = "Air Fryer. I use the Breville Smart Oven Air"
+        journal = CatalogActionJournal(self.path)
+        journal.append(
+            "submitted",
+            actionId="flagged-create",
+            operation="create",
+            kind="food",
+            sourceName="Air Fryer food",
+            reservedKeys=["food:air fryer food", f"line:{raw.casefold()}"],
+            proposal={"name": "Air Fryer food"},
+            disposition={"type": "ingredient"},
+            dispositionRaw=raw,
+        )
+        item = {"id": "food-air-fryer", "name": "Air Fryer food", "aliases": []}
+        journal.append("completed", actionId="flagged-create", item=item)
+        loaded = PendingCatalogQueue(self.path).load()
+
+        errors = journal.recover(loaded, self.index, ToolIndex())
+
+        self.assertEqual(errors, {})
+        self.assertEqual(loaded.line_disposition(raw)["type"], "ingredient")
+
+    def test_uncertain_tool_creation_reconciles_by_exact_tool_name(self):
+        raw = "Wok. I use a carbon steel model."
+        journal = CatalogActionJournal(self.path)
+        journal.append(
+            "submitted",
+            actionId="tool-action",
+            operation="create_tool",
+            kind="line",
+            sourceName=raw,
+            reservedKeys=[f"line:{raw.casefold()}"],
+            disposition={"type": "equipment", "toolName": "Wok"},
+        )
+        tools = ToolIndex()
+        tools.replace([{"id": "tool-wok", "name": "Wok"}])
+        loaded = PendingCatalogQueue(self.path).load()
+
+        errors = journal.recover(loaded, self.index, tools)
+
+        self.assertEqual(errors, {})
+        self.assertEqual(loaded.line_disposition(raw)["toolName"], "Wok")
+
 
 class ReplayTests(unittest.TestCase):
     def setUp(self):
@@ -685,6 +947,72 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(self.api.updated_recipes, [])
         self.assertNotIn(record["slug"], self.queue.recipes)
         self.assertNotIn(record["slug"], history)
+
+    def test_note_disposition_suppresses_food_and_unit_and_preserves_exact_text(self):
+        raw = "I prefer to make this a day ahead."
+        record = blocked_record(food="I prefer", unit="day")
+        record["sourceIngredients"] = [raw]
+        record["missing"][0]["raw"] = raw
+        record["missing"][1]["raw"] = raw
+        record["lineReviews"] = [
+            {"ingredientIndex": 0, **classify_review_line(raw)}
+        ]
+        self.queue.upsert_recipe(record)
+        self.queue.set_line_disposition(raw, "note")
+        self.api.recipes[record["slug"]] = {
+            "slug": record["slug"],
+            "recipeIngredient": [raw],
+            "tools": [],
+        }
+
+        stats = replay_ready_recipes(self.queue, self.index, self.api, set())
+
+        self.assertEqual(stats["updated"], 1)
+        self.assertEqual(
+            self.api.recipes[record["slug"]]["recipeIngredient"],
+            [{"note": raw, "originalText": raw}],
+        )
+
+    def test_equipment_disposition_merges_tool_without_removing_existing_tools(self):
+        raw = "Air Fryer. I use the Breville Smart Oven Air"
+        record = flagged_record(raw=raw)
+        record["lineReviews"] = [
+            {"ingredientIndex": 0, **classify_review_line(raw)}
+        ]
+        self.queue.upsert_recipe(record)
+        self.queue.set_line_disposition(raw, "equipment", "Air Fryer")
+        existing_tool = {"id": "tool-oven", "name": "Oven", "slug": "oven"}
+        self.api.recipes[record["slug"]] = {
+            "slug": record["slug"],
+            "recipeIngredient": [raw],
+            "tools": [existing_tool],
+        }
+        tools = ToolIndex()
+        tools.replace(self.api.list_tools())
+
+        stats = replay_ready_recipes(
+            self.queue, self.index, self.api, set(), tool_index=tools
+        )
+
+        self.assertEqual(stats["updated"], 1)
+        self.assertEqual(
+            [tool["name"] for tool in self.api.recipes[record["slug"]]["tools"]],
+            ["Oven", "Air Fryer"],
+        )
+
+    def test_unresolved_line_blocks_replay_even_when_catalog_name_exists(self):
+        raw = "Air Fryer. I use the Breville Smart Oven Air"
+        record = flagged_record(raw=raw, food="sugar")
+        self.queue.upsert_recipe(record)
+        self.api.recipes[record["slug"]] = {
+            "slug": record["slug"],
+            "recipeIngredient": [raw],
+        }
+
+        stats = replay_ready_recipes(self.queue, self.index, self.api, set())
+
+        self.assertEqual(stats["waiting"], 1)
+        self.assertEqual(self.api.updated_recipes, [])
 
 
 class FakeResponse:
@@ -739,11 +1067,13 @@ class FakeParserSession:
         self.recipe = recipe
         self.parsed = parsed
         self.puts = []
+        self.posts = []
 
     def get(self, url, timeout=None):
         return FakeResponse(200, self.recipe)
 
     def post(self, url, json=None, timeout=None):
+        self.posts.append((url, copy.deepcopy(json)))
         return FakeResponse(200, self.parsed)
 
     def put(self, url, json=None, timeout=None):
@@ -752,6 +1082,10 @@ class FakeParserSession:
 
 
 class ParserSafetyTests(unittest.TestCase):
+    def setUp(self):
+        parser.LINE_DISPOSITIONS = {}
+        parser.TOOL_INDEX = ToolIndex()
+
     def test_missing_food_and_unit_never_put_recipe(self):
         recipe = {"slug": "test", "recipeIngredient": ["1 scoop drinking chocolate"]}
         parsed = [
@@ -835,6 +1169,78 @@ class ParserSafetyTests(unittest.TestCase):
         self.assertEqual(
             result.blocked_record["proposedIngredients"][0]["food"]["name"],
             '3/4" Thick Flat Iron Steaks',
+        )
+
+    def test_likely_equipment_requires_review_even_with_confident_parser_result(self):
+        raw = "Air Fryer. I use the Breville Smart Oven Air"
+        recipe = {"slug": "air-fryer-note", "recipeIngredient": [raw]}
+        parsed = [
+            {
+                "confidence": {"average": 1.0},
+                "ingredient": {"food": {"id": "food-existing", "name": "Air Fryer"}},
+            }
+        ]
+        session = FakeParserSession(recipe, parsed)
+        index = CatalogIndex()
+        index.replace("food", [{"id": "food-existing", "name": "Air Fryer"}])
+        index.replace("unit", [])
+
+        with patch.object(parser, "get_session", return_value=session), patch.object(
+            parser, "CATALOG_INDEX", index
+        ), patch.object(parser, "DRY_RUN", False):
+            result = parser.process_recipe("air-fryer-note")
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.blocked_record["missing"], [])
+        self.assertEqual(
+            result.blocked_record["lineReviews"][0]["recommendation"], "equipment"
+        )
+        self.assertEqual(session.puts, [])
+
+    def test_persisted_note_skips_parser_and_preserves_original_text(self):
+        raw = "I prefer to make this a day ahead."
+        recipe = {"slug": "saved-note", "recipeIngredient": [raw], "tools": []}
+        session = FakeParserSession(recipe, [])
+        parser.LINE_DISPOSITIONS = {
+            raw.casefold(): {"type": "note", "raw": raw}
+        }
+
+        with patch.object(parser, "get_session", return_value=session), patch.object(
+            parser, "DRY_RUN", False
+        ):
+            result = parser.process_recipe("saved-note")
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(session.posts, [])
+        self.assertEqual(
+            session.puts[0][1]["recipeIngredient"],
+            [{"note": raw, "originalText": raw}],
+        )
+
+    def test_persisted_equipment_skips_parser_and_merges_tool(self):
+        raw = "Air Fryer. I use the Breville Smart Oven Air"
+        recipe = {
+            "slug": "saved-equipment",
+            "recipeIngredient": [raw],
+            "tools": [{"id": "tool-oven", "name": "Oven"}],
+        }
+        session = FakeParserSession(recipe, [])
+        parser.LINE_DISPOSITIONS = {
+            raw.casefold(): {"type": "equipment", "raw": raw, "toolName": "Air Fryer"}
+        }
+        parser.TOOL_INDEX.replace(
+            [{"id": "tool-air-fryer", "name": "Air Fryer", "slug": "air-fryer"}]
+        )
+
+        with patch.object(parser, "get_session", return_value=session), patch.object(
+            parser, "DRY_RUN", False
+        ):
+            result = parser.process_recipe("saved-equipment")
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(
+            [tool["name"] for tool in session.puts[0][1]["tools"]],
+            ["Oven", "Air Fryer"],
         )
 
 

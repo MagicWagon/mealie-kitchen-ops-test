@@ -19,6 +19,9 @@ from kitchen_ops_catalog import (
     CatalogIndex,
     CatalogReviewer,
     PendingCatalogQueue,
+    ToolIndex,
+    classify_review_line,
+    normalize_name,
     pending_summary,
     replay_ready_recipes,
 )
@@ -62,6 +65,8 @@ PG_HOST: str = os.getenv('POSTGRES_HOST', 'postgres')
 PG_PORT: str = os.getenv('POSTGRES_PORT', '5432')
 
 CATALOG_INDEX = CatalogIndex()
+TOOL_INDEX = ToolIndex()
+LINE_DISPOSITIONS: dict[str, dict[str, Any]] = {}
 HISTORY_SET: set[str] = set()
 HISTORY_LOCK = threading.Lock()
 thread_local = threading.local()
@@ -332,66 +337,86 @@ def process_recipe(slug: str) -> ProcessResult:
     to_parse: list[str] = []
     to_parse_indices: list[int] = []
     clean_ingredients: list[Optional[dict]] = []
+    line_reviews: list[dict[str, Any]] = []
+    equipment_tool_names: set[str] = set()
+    disposition_changed = False
 
     for i, item in enumerate(raw_ingredients):
-        if isinstance(item, str):
-            to_parse.append(item)
-            to_parse_indices.append(i)
-            clean_ingredients.append(None)
-        elif isinstance(item, dict) and item.get("note") and not item.get("unit") and not item.get("food"):
-            to_parse.append(item["note"])
+        is_loose = isinstance(item, str) or (
+            isinstance(item, dict) and item.get("note") and not item.get("unit") and not item.get("food")
+        )
+        if is_loose:
+            raw_text = _raw_text(item)
+            disposition = LINE_DISPOSITIONS.get(normalize_name(raw_text))
+            if disposition and disposition.get("type") in ("note", "equipment"):
+                clean_ingredients.append(
+                    {"note": raw_text, "originalText": raw_text}
+                )
+                disposition_changed = True
+                if disposition.get("type") == "equipment":
+                    tool_name = disposition.get("toolName")
+                    if tool_name:
+                        equipment_tool_names.add(str(tool_name))
+                continue
+            classification = classify_review_line(raw_text)
+            if classification and not (
+                disposition and disposition.get("type") == "ingredient"
+            ):
+                line_reviews.append({"ingredientIndex": i, **classification})
+            to_parse.append(raw_text)
             to_parse_indices.append(i)
             clean_ingredients.append(None)
         else:
             clean_ingredients.append(item)
 
-    if not to_parse:
+    if not to_parse and not disposition_changed:
         return ProcessResult("success", slug)
 
     # NLP pass
-    try:
-        r_nlp = session.post(
-            f"{MEALIE_URL}/api/parser/ingredients",
-            json={"ingredients": to_parse, "parser": "nlp", "language": "en"},
-            timeout=30
-        )
-        if r_nlp.status_code != 200:
-            return ProcessResult("failed", slug, error=f"NLP parser returned {r_nlp.status_code}")
-        nlp_results = r_nlp.json()
-        retry_sub_indices: list[int] = []
-        retry_texts: list[str] = []
+    if to_parse:
+        try:
+            r_nlp = session.post(
+                f"{MEALIE_URL}/api/parser/ingredients",
+                json={"ingredients": to_parse, "parser": "nlp", "language": "en"},
+                timeout=30
+            )
+            if r_nlp.status_code != 200:
+                return ProcessResult("failed", slug, error=f"NLP parser returned {r_nlp.status_code}")
+            nlp_results = r_nlp.json()
+            retry_sub_indices: list[int] = []
+            retry_texts: list[str] = []
 
-        for idx, text in enumerate(to_parse):
-            if idx >= len(nlp_results):
-                retry_sub_indices.append(to_parse_indices[idx])
-                retry_texts.append(text)
-                continue
-            res = nlp_results[idx]
-            score = res.get("confidence", {}).get("average", 0)
-            actual_index = to_parse_indices[idx]
-            if score < CONFIDENCE_THRESHOLD:
-                retry_sub_indices.append(actual_index)
-                retry_texts.append(text)
-            else:
-                clean_ingredients[actual_index] = res
+            for idx, text in enumerate(to_parse):
+                if idx >= len(nlp_results):
+                    retry_sub_indices.append(to_parse_indices[idx])
+                    retry_texts.append(text)
+                    continue
+                res = nlp_results[idx]
+                score = res.get("confidence", {}).get("average", 0)
+                actual_index = to_parse_indices[idx]
+                if score < CONFIDENCE_THRESHOLD:
+                    retry_sub_indices.append(actual_index)
+                    retry_texts.append(text)
+                else:
+                    clean_ingredients[actual_index] = res
 
-        # AI escalation
-        if retry_texts:
-            try:
-                r_ai = session.post(
-                    f"{MEALIE_URL}/api/parser/ingredients",
-                    json={"ingredients": retry_texts, "parser": "openai", "language": "en"},
-                    timeout=45
-                )
-                if r_ai.status_code == 200:
-                    for ai_idx, ai_res in enumerate(r_ai.json()):
-                        if ai_idx < len(retry_sub_indices):
-                            clean_ingredients[retry_sub_indices[ai_idx]] = ai_res
-            except requests.RequestException as exc:
-                return ProcessResult("failed", slug, error=f"OpenAI parser failed: {exc}")
+            # AI escalation
+            if retry_texts:
+                try:
+                    r_ai = session.post(
+                        f"{MEALIE_URL}/api/parser/ingredients",
+                        json={"ingredients": retry_texts, "parser": "openai", "language": "en"},
+                        timeout=45
+                    )
+                    if r_ai.status_code == 200:
+                        for ai_idx, ai_res in enumerate(r_ai.json()):
+                            if ai_idx < len(retry_sub_indices):
+                                clean_ingredients[retry_sub_indices[ai_idx]] = ai_res
+                except requests.RequestException as exc:
+                    return ProcessResult("failed", slug, error=f"OpenAI parser failed: {exc}")
 
-    except requests.RequestException as exc:
-        return ProcessResult("failed", slug, error=str(exc))
+        except requests.RequestException as exc:
+            return ProcessResult("failed", slug, error=str(exc))
 
     # Reconstruct
     final_list: list[Any] = []
@@ -409,7 +434,7 @@ def process_recipe(slug: str) -> ProcessResult:
             _resolve_catalog_reference("unit", target, i, raw_ingredients[i], missing)
             final_list.append(target)
 
-    if missing:
+    if missing or line_reviews:
         for item in missing:
             logger.info(
                 "MISSING %s: %r | recipe=%s index=%s raw=%r",
@@ -427,11 +452,27 @@ def process_recipe(slug: str) -> ProcessResult:
                 "sourceIngredients": raw_ingredients,
                 "proposedIngredients": final_list,
                 "missing": missing,
+                "lineReviews": line_reviews,
                 "queuedAt": datetime.now().isoformat(timespec="seconds"),
             },
         )
 
     full_recipe["recipeIngredient"] = final_list
+    if equipment_tool_names:
+        desired_tools = list(full_recipe.get("tools") or [])
+        known_ids = {str(tool.get("id")) for tool in desired_tools if tool.get("id")}
+        known_names = {normalize_name(tool.get("name")) for tool in desired_tools}
+        for tool_name in sorted(equipment_tool_names, key=str.casefold):
+            tool = TOOL_INDEX.resolve(tool_name)
+            if not tool:
+                return ProcessResult(
+                    "failed", slug, error=f"Previously selected tool {tool_name!r} no longer exists"
+                )
+            if str(tool["id"]) not in known_ids and normalize_name(tool["name"]) not in known_names:
+                desired_tools.append(tool)
+                known_ids.add(str(tool["id"]))
+                known_names.add(normalize_name(tool["name"]))
+        full_recipe["tools"] = desired_tools
 
     if DRY_RUN:
         return ProcessResult("dry_run", slug)
@@ -479,11 +520,11 @@ def review_pending_catalog(
             "SCRIPT_TO_RUN=catalog-review.[/warning]"
         )
         return 0
-    if ask_first and not Confirm.ask("Review pending foods and units now?", default=True, console=console):
+    if ask_first and not Confirm.ask("Review pending catalog items and flagged lines now?", default=True, console=console):
         console.print("Review deferred; the queue has been saved.")
         return 0
 
-    reviewer = CatalogReviewer(queue, CATALOG_INDEX, api, console)
+    reviewer = CatalogReviewer(queue, CATALOG_INDEX, api, console, TOOL_INDEX)
     action_failures = reviewer.review()
     try:
         api.refresh(CATALOG_INDEX)
@@ -493,6 +534,7 @@ def review_pending_catalog(
             api,
             HISTORY_SET,
             logger=lambda message: logger.info(message),
+            tool_index=TOOL_INDEX,
         )
     except Exception as exc:
         console.print(f"[error]Catalog replay failed: {exc}[/error]")
@@ -509,7 +551,7 @@ def review_pending_catalog(
 
 
 def main() -> int:
-    global HISTORY_SET
+    global HISTORY_SET, LINE_DISPOSITIONS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--review-catalog",
@@ -535,9 +577,11 @@ def main() -> int:
         )
     try:
         refresh_catalog(api)
+        TOOL_INDEX.replace(api.list_tools())
     except Exception as exc:
-        console.print(f"[error]Could not load Mealie catalog: {exc}[/error]")
+        console.print(f"[error]Could not load Mealie catalogs: {exc}[/error]")
         return 1
+    LINE_DISPOSITIONS = copy.deepcopy(queue.data.get("lineDispositions", {}))
     HISTORY_SET = load_history()
 
     if args.review_catalog:

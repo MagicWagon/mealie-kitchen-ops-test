@@ -167,9 +167,17 @@ On an interactive live run, KitchenOps offers to review the queue after parsing.
 6. Review all eligible proposals and optionally accept them as a batch.
 7. Quit.
 
+KitchenOps also conservatively flags ingredient lines that look like prose or configured equipment. For example, `Air Fryer. I use the Breville Smart Oven Air` is presented as likely equipment instead of being offered directly as a food. Classification is advisory: flagged lines require an explicit choice and cannot be included in bulk food or unit creation.
+
+Flagged lines use a context-first menu. The recommended Note or Equipment action appears first, followed by the normal create and mapping choices, an option to confirm that the line really is an ingredient, Skip, bulk review, and Quit. Equipment matching uses the same `tools_matches` configuration as the tagger. If the selected Mealie tool is missing, KitchenOps shows its exact name and requires a default-No confirmation before creating it.
+
+Choosing Note preserves the original text exactly as a note-only ingredient row. Choosing Equipment does the same and merges the selected tool into the recipe without removing existing tools. Choosing Ingredient suppresses future classification warnings and resumes normal food/unit resolution. These decisions apply only to occurrences with identical normalized original text; differently worded lines remain independent.
+
 Create and alias actions run in submission order on a background worker, so the next review item appears immediately instead of waiting for a full Mealie catalog refresh. The status line shows how many actions are pending. Names, plurals, aliases, and unit abbreviations affected by a pending creation are temporarily reserved so they are not reviewed twice.
 
 Completed actions update the in-memory catalog directly and report any related proposals that were resolved automatically. A failed action and its related reservations return to the review list with the error visible. KitchenOps records submitted and completed decisions in `logs/parser_pending_catalog.json.journal` and checkpoints the main queue in the background, preserving decisions if the process is interrupted.
+
+Explicit Note, Equipment, and Ingredient decisions are retained in the version-1 queue's `lineDispositions` registry. Future parser runs consult that registry before sending matching lines to Mealie's ingredient parser, preventing a decided note or equipment line from returning as a proposed food. Existing queue files are upgraded in memory with optional line-review fields and require no migration.
 
 Choosing Quit stops new decisions but waits for submitted catalog actions to finish and saves a final queue checkpoint before recipe updates begin.
 
@@ -187,7 +195,7 @@ docker run -it --rm \
   ghcr.io/d0rk4ce/mealie-kitchen-ops:latest
 ```
 
-After all required foods and units for a recipe are resolved, KitchenOps refetches the recipe, verifies that its ingredients have not changed, and applies the stored proposal. Dry-run mode may populate the review queue, but it never creates catalog items, updates recipes, or marks recipes as completed.
+After every flagged line and all required foods and units for a recipe are resolved, KitchenOps refetches the recipe, verifies that its ingredients have not changed, and applies the stored ingredients and tool relationships together. Dry-run mode may populate the review queue, but it never creates catalog items or tools, updates recipes, or marks recipes as completed.
 
 For unattended runs, pending catalog review is an expected outcome and exits successfully after saving the queue. API failures still produce a failed run.
 
