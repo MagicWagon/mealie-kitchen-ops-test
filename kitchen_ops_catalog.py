@@ -730,9 +730,13 @@ class PendingCatalogQueue:
                         "raw": missing.get("raw", ""),
                     }
                 )
+        group_rank = {group: index for index, group in enumerate(REVIEW_GROUPS)}
         return sorted(
             grouped.values(),
-            key=lambda item: (0 if item["kind"] == "line" else 1, item["kind"], normalize_name(item["name"])),
+            key=lambda item: (
+                group_rank[review_group(item)],
+                normalize_name(item.get("name", "")),
+            ),
         )
 
 
@@ -1071,6 +1075,7 @@ class CatalogActionResult:
     error: Optional[str] = None
     refreshed_items: Optional[list[dict[str, Any]]] = None
     disposition: Optional[dict[str, Any]] = None
+    created: bool = False
 
 
 class CatalogActionRunner:
@@ -1151,6 +1156,7 @@ class CatalogActionRunner:
             action=action,
             item=copy.deepcopy(item),
             disposition=copy.deepcopy(disposition or action.disposition),
+            created=False,
         )
 
     def _run(self, action: CatalogAction) -> None:
@@ -1187,6 +1193,7 @@ class CatalogActionRunner:
                     action=action,
                     item=item,
                     disposition=copy.deepcopy(action.disposition),
+                    created=action.operation == "create",
                 )
             )
         except Exception as exc:
@@ -1213,6 +1220,7 @@ class CatalogActionRunner:
                                 action=action,
                                 item=item,
                                 disposition=copy.deepcopy(action.disposition),
+                                created=False,
                             )
                         )
                         return
@@ -1391,6 +1399,48 @@ def replay_ready_recipes(
     return stats
 
 
+REVIEW_GROUPS = ("ingredient", "unit", "note")
+REVIEW_GROUP_LABELS = {
+    "ingredient": "Ingredients",
+    "unit": "Units",
+    "note": "Notes",
+}
+
+
+def review_group(entry: dict[str, Any]) -> str:
+    """Return the user-facing review group for a queue entry."""
+    if entry.get("kind") == "food":
+        return "ingredient"
+    if entry.get("kind") == "unit":
+        return "unit"
+    if entry.get("kind") == "line" and entry.get("recommendation") == "ingredient":
+        return "ingredient"
+    return "note"
+
+
+@dataclass
+class ReviewSummary:
+    """Human-readable outcomes collected during one catalog review session."""
+
+    created_ingredients: list[str] = field(default_factory=list)
+    created_units: list[str] = field(default_factory=list)
+    mapped_with_alias: list[str] = field(default_factory=list)
+    mapped_once: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    confirmed_ingredients: list[str] = field(default_factory=list)
+    deferred: list[str] = field(default_factory=list)
+    automatically_matched: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+
+    @staticmethod
+    def _add_unique(values: list[str], value: str) -> None:
+        if value and value not in values:
+            values.append(value)
+
+    def add(self, field_name: str, value: Any) -> None:
+        self._add_unique(getattr(self, field_name), str(value))
+
+
 @dataclass
 class CatalogReviewer:
     queue: PendingCatalogQueue
@@ -1434,7 +1484,7 @@ class CatalogReviewer:
 
     def choose_mapping(self, entry: dict[str, Any]) -> Optional[dict[str, Any]]:
         candidates = self.index.search(entry["kind"], entry["name"], limit=5)
-        search_label = "Search catalog"
+        search_label = "Search for another item"
         while True:
             if candidates:
                 self._candidate_table(candidates)
@@ -1454,14 +1504,16 @@ class CatalogReviewer:
             if selected == cancel_choice:
                 return None
 
-            query = Prompt.ask("Search catalog", default=entry["name"], console=self.console)
+            query = Prompt.ask(
+                "Search existing items", default=entry["name"], console=self.console
+            )
             candidates = self.index.search(entry["kind"], query, limit=10)
             search_label = "Search again"
             if not candidates:
-                self.console.print("[warning]No catalog matches found.[/warning]")
+                self.console.print("[warning]No existing items found.[/warning]")
 
     def _candidate_table(self, candidates: list[dict[str, Any]]) -> None:
-        table = Table(title="Catalog candidates")
+        table = Table(title="Possible existing items")
         table.add_column("#", justify="right")
         table.add_column("Name")
         table.add_column("Aliases")
@@ -1470,24 +1522,63 @@ class CatalogReviewer:
         self.console.print(table)
 
     @staticmethod
+    def _entry_group(entry: dict[str, Any]) -> str:
+        return review_group(entry)
+
+    @classmethod
+    def _entry_group_label(cls, entry: dict[str, Any]) -> str:
+        return REVIEW_GROUP_LABELS[cls._entry_group(entry)]
+
+    @classmethod
+    def _sort_entries(cls, entries: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        rank = {group: index for index, group in enumerate(REVIEW_GROUPS)}
+        return sorted(
+            entries,
+            key=lambda item: (
+                rank[cls._entry_group(item)],
+                normalize_name(item.get("name", "")),
+            ),
+        )
+
+    @staticmethod
+    def _plain_reason(reason: str) -> str:
+        if reason == "matched configured equipment phrase":
+            return "This looks like a note rather than a measured ingredient."
+        if reason == "mentions configured equipment but starts like an ingredient line":
+            return "This starts like an ingredient but includes extra instructions."
+        if reason == "looks like prose rather than a measured ingredient":
+            return "This looks like a note rather than a measured ingredient."
+        return reason
+
+    @staticmethod
     def _display_value(value: Any) -> str:
         if isinstance(value, list):
             values = [
                 item.get("name") if isinstance(item, dict) else item
                 for item in value
             ]
-            return ", ".join(repr(item) for item in values if item not in (None, ""))
-        return repr(value)
+            return ", ".join(str(item) for item in values if item not in (None, ""))
+        return str(value)
 
     @classmethod
     def _proposal_fields(cls, entry: dict[str, Any]) -> list[tuple[str, str]]:
         proposal = entry.get("proposal") or {}
         proposed_name = proposal.get("name") or entry.get("name")
-        fields: list[tuple[str, str]] = [("name", cls._display_value(proposed_name))]
+        labels = {
+            "name": "Name",
+            "pluralName": "Plural name",
+            "description": "Description",
+            "aliases": "Other names",
+            "abbreviation": "Short form",
+            "pluralAbbreviation": "Plural short form",
+            "fraction": "Supports fractions",
+            "useAbbreviation": "Uses short form",
+        }
+        fields: list[tuple[str, str]] = [("Name", cls._display_value(proposed_name))]
         for field, value in proposal.items():
             if field == "name" or value is None or value == "" or value == [] or value == {}:
                 continue
-            fields.append((field, cls._display_value(value)))
+            fields.append((labels.get(field, field.replace("_", " ").title()), cls._display_value(value)))
         return fields
 
     @staticmethod
@@ -1497,7 +1588,7 @@ class CatalogReviewer:
             f"{occurrence['slug']}: {occurrence['raw']}" for occurrence in occurrences[:2]
         ]
         if len(occurrences) > 2:
-            examples.append(f"…and {len(occurrences) - 2} more recipe usages")
+            examples.append(f"…and {len(occurrences) - 2} more recipe(s)")
         return examples
 
     def _show_entry(
@@ -1507,162 +1598,97 @@ class CatalogReviewer:
         skipped: int,
         pending: int = 0,
         error: Optional[str] = None,
+        group_position: Optional[int] = None,
+        group_total: Optional[int] = None,
     ) -> None:
-        title = "Line classification" if entry["kind"] == "line" else entry["kind"].title()
+        group_label = self._entry_group_label(entry)
+        title = group_label
+        if group_position is not None and group_total is not None:
+            title += f" — {group_position} of {group_total}"
         self.console.rule(f"[bold cyan]{title}: {escape(str(entry['name']))}[/bold cyan]")
-        status = f"{remaining} unresolved item(s) remain"
+        status = f"{remaining} item(s) remain in this review"
         if skipped:
-            status += f"; {skipped} skipped this session"
+            status += f"; {skipped} deferred"
         if pending:
-            status += f"; {pending} action(s) pending"
+            status += f"; {pending} item(s) are being saved"
         self.console.print(status, markup=False)
         if error:
-            self.console.print(f"[error]Previous action failed: {escape(error)}[/error]")
+            self.console.print(f"[error]This item could not be saved: {escape(error)}[/error]")
         if entry["kind"] == "line":
             recommendation = entry.get("recommendation", "note")
-            if recommendation == "equipment":
-                tools = ", ".join(entry.get("toolMatches") or []) or "equipment"
+            if recommendation == "ingredient":
+                headline = "This starts like an ingredient but includes extra instructions."
                 self.console.print(
-                    f"[warning]Manual classification required: likely equipment ({escape(tools)}).[/warning]"
-                )
-            elif recommendation == "ingredient":
-                tools = ", ".join(entry.get("toolMatches") or []) or "equipment"
-                self.console.print(
-                    f"[warning]Ingredient line mentions equipment: {escape(tools)}.[/warning]"
-                )
-                self.console.print(
-                    "Equipment detection is advisory; add equipment only if the entire line is equipment-related.",
-                    markup=False,
+                    f"[warning]{headline}[/warning]"
                 )
             else:
+                headline = "This looks like a note rather than a measured ingredient."
                 self.console.print(
-                    "[warning]Manual classification required: likely an ingredient note.[/warning]"
+                    f"[warning]{headline}[/warning]"
                 )
             for reason in entry.get("reasons") or []:
-                self.console.print(f"  Reason: {reason}", markup=False)
+                plain_reason = self._plain_reason(str(reason))
+                if plain_reason != headline:
+                    self.console.print(f"  {plain_reason}", markup=False)
             catalog_entries = entry.get("catalogEntries") or []
             if catalog_entries:
                 candidate = catalog_entries[0]
                 self.console.print(
-                    f"Parser proposed this {candidate['kind']} if you confirm it is an ingredient:",
+                    f"Suggested {('ingredient' if candidate['kind'] == 'food' else 'unit')} if this line is an ingredient:",
                     style="bold",
                 )
                 for field_name, value in self._proposal_fields(candidate):
                     self.console.print(f"  {field_name}: {value}", markup=False)
             self.console.print(
-                f"Used by [cyan]{len(entry['occurrences'])}[/cyan] recipe ingredient(s)"
+                f"Appears in [cyan]{len(entry['occurrences'])}[/cyan] recipe(s)"
             )
             for example in self._usage_examples(entry):
                 self.console.print(f"  • {example}", markup=False)
             return
-        self.console.print(f"Create would submit this {entry['kind']}:", style="bold")
+        self.console.print(
+            f"Suggested {('ingredient' if entry['kind'] == 'food' else 'unit')} details:",
+            style="bold",
+        )
         for field, value in self._proposal_fields(entry):
             self.console.print(f"  {field}: {value}", markup=False)
         self.console.print(
-            f"Used by [cyan]{len(entry['occurrences'])}[/cyan] recipe ingredient(s)"
+            f"Appears in [cyan]{len(entry['occurrences'])}[/cyan] recipe(s)"
         )
         for example in self._usage_examples(entry):
             self.console.print(f"  • {example}", markup=False)
         if entry.get("ambiguous"):
             self.console.print(
-                "[warning]Manual review required: this name has ambiguous catalog matches.[/warning]"
+                "[warning]More than one existing item could match this name; choose one or edit the suggestion.[/warning]"
             )
         suggestions = self.index.search(entry["kind"], entry["name"], limit=5)
         if suggestions:
             self.console.print(
-                "Closest existing: " + ", ".join(item["name"] for item in suggestions),
+                "Possible existing matches: " + ", ".join(item["name"] for item in suggestions),
                 markup=False,
             )
 
     def _show_actions(self) -> None:
-        self.console.print("1) Create the proposed item", markup=False)
-        self.console.print("2) Edit details, then create", markup=False)
-        self.console.print("3) Map to an existing item and save an alias", markup=False)
-        self.console.print("4) Map to an existing item for this review queue only", markup=False)
-        self.console.print("5) Skip for now", markup=False)
-        self.console.print(
-            "6) Review all eligible proposals, then optionally accept all", markup=False
-        )
-        self.console.print("7) Quit", markup=False)
+        self.console.print("1) Create the suggested item", markup=False)
+        self.console.print("2) Change details, then create", markup=False)
+        self.console.print("3) Use an existing item and remember this name", markup=False)
+        self.console.print("4) Use an existing item this time only", markup=False)
+        self.console.print("7) Defer until later", markup=False)
+        self.console.print("0) Finish review", markup=False)
 
     def _show_line_actions(self, entry: dict[str, Any]) -> None:
-        recommendation = entry.get("recommendation", "note")
-        tool_name = (entry.get("toolMatches") or ["selected equipment"])[0]
-        if recommendation == "ingredient":
-            self.console.print("1) Create the proposed catalog item", markup=False)
-            self.console.print("2) Edit details, then create", markup=False)
-            self.console.print("3) Map to an existing item and save an alias", markup=False)
-            self.console.print("4) Map to an existing item for this review queue only", markup=False)
-            self.console.print("5) Keep this line as a note only", markup=False)
-            self.console.print(
-                f"6) Classify this line as equipment and keep it as a note ({tool_name})",
-                markup=False,
-            )
-            self.console.print("7) Skip for now", markup=False)
-            self.console.print(
-                "8) Review all eligible proposals, then optionally accept all", markup=False
-            )
-            self.console.print("9) Confirm this is an ingredient and continue normal review", markup=False)
-            self.console.print("10) Quit", markup=False)
-            return
-        if recommendation == "equipment":
-            self.console.print(
-                f"1) Add {tool_name!r} as equipment and keep this line as a note (recommended)",
-                markup=False,
-            )
-            self.console.print("2) Keep this line as a note only", markup=False)
+        if entry.get("catalogEntries"):
+            self.console.print("1) Create the suggested item", markup=False)
+            self.console.print("2) Change details, then create", markup=False)
+            self.console.print("3) Use an existing item and remember this name", markup=False)
+            self.console.print("4) Use an existing item this time only", markup=False)
+        if entry.get("recommendation") == "ingredient":
+            self.console.print("5) Treat this line as an ingredient", markup=False)
+            self.console.print("6) Keep this line as a note", markup=False)
         else:
-            self.console.print("1) Keep this line as a note (recommended)", markup=False)
-            self.console.print("2) Choose equipment and keep this line as a note", markup=False)
-        self.console.print("3) Create the proposed catalog item", markup=False)
-        self.console.print("4) Edit details, then create", markup=False)
-        self.console.print("5) Map to an existing item and save an alias", markup=False)
-        self.console.print("6) Map to an existing item for this review queue only", markup=False)
-        self.console.print("7) Confirm this is an ingredient and continue normal review", markup=False)
-        self.console.print("8) Skip for now", markup=False)
-        self.console.print("9) Review all eligible proposals, then optionally accept all", markup=False)
-        self.console.print("10) Quit", markup=False)
-
-    def _bulk_table(self, entries: list[dict[str, Any]]) -> None:
-        table = Table(title="Review proposed catalog items")
-        table.add_column("Type")
-        table.add_column("Proposed item")
-        table.add_column("Other submitted fields")
-        table.add_column("Usages", justify="right")
-        table.add_column("Recipe usage examples")
-        table.add_column("Closest existing")
-        table.add_column("Status")
-        for entry in entries:
-            if entry.get("kind") == "line":
-                table.add_row(
-                    "line",
-                    escape(str(entry.get("name") or "")),
-                    "—",
-                    str(len(entry.get("occurrences") or [])),
-                    escape("\n".join(self._usage_examples(entry))),
-                    "—",
-                    "Manual classification required",
-                )
-                continue
-            fields = self._proposal_fields(entry)
-            details = ", ".join(f"{field}={value}" for field, value in fields if field != "name")
-            suggestions = self.index.search(entry["kind"], entry["name"], limit=5)
-            if entry.get("ambiguous"):
-                status = "Manual review required"
-            elif not entry.get("name"):
-                status = "Missing proposed name"
-            else:
-                status = "Eligible"
-            table.add_row(
-                entry["kind"],
-                escape(str((entry.get("proposal") or {}).get("name") or entry.get("name") or "")),
-                escape(details) or "—",
-                str(len(entry.get("occurrences") or [])),
-                escape("\n".join(self._usage_examples(entry))),
-                escape(", ".join(item["name"] for item in suggestions)) or "—",
-                status,
-            )
-        self.console.print(table)
+            self.console.print("5) Treat this line as an ingredient", markup=False)
+            self.console.print("6) Keep this line as a note (recommended)", markup=False)
+        self.console.print("7) Defer until later", markup=False)
+        self.console.print("0) Finish review", markup=False)
 
     @staticmethod
     def _proposal_names(kind: str, proposal: dict[str, Any]) -> list[str]:
@@ -1734,75 +1760,6 @@ class CatalogReviewer:
         )
         pending_by_key[entry["key"]] = action.action_id
         runner.submit_local(action, disposition=disposition)
-
-    def _choose_tool_name(self, entry: dict[str, Any]) -> Optional[str]:
-        configured = list(entry.get("toolMatches") or [])
-        candidates: list[tuple[str, Optional[dict[str, Any]]]] = []
-        for name in configured:
-            candidates.append((name, self.tool_index.resolve(name)))
-        for item in self.tool_index.search(entry.get("raw", ""), limit=5):
-            if normalize_name(item["name"]) not in {normalize_name(name) for name, _ in candidates}:
-                candidates.append((item["name"], item))
-        while True:
-            table = Table(title="Equipment choices")
-            table.add_column("#", justify="right")
-            table.add_column("Tool")
-            table.add_column("Status")
-            for number, (name, item) in enumerate(candidates, 1):
-                table.add_row(str(number), name, "Exists" if item else "Would be created")
-            self.console.print(table)
-            search_choice = len(candidates) + 1
-            cancel_choice = len(candidates) + 2
-            self.console.print(f"{search_choice}) Search or enter another tool", markup=False)
-            self.console.print(f"{cancel_choice}) Cancel", markup=False)
-            choice = Prompt.ask(
-                "Choose equipment",
-                choices=[str(value) for value in range(1, cancel_choice + 1)],
-                default="1" if candidates else str(cancel_choice),
-                console=self.console,
-            )
-            selected = int(choice)
-            if selected <= len(candidates):
-                return candidates[selected - 1][0]
-            if selected == cancel_choice:
-                return None
-            query = Prompt.ask("Search tools", console=self.console).strip()
-            if not query:
-                continue
-            results = self.tool_index.search(query, limit=10)
-            candidates = [(item["name"], item) for item in results]
-            if not any(normalize_name(name) == normalize_name(query) for name, _ in candidates):
-                candidates.append((query, None))
-
-    def _start_equipment_action(
-        self,
-        entry: dict[str, Any],
-        tool_name: str,
-        pending_by_key: dict[str, str],
-        runner: CatalogActionRunner,
-    ) -> Optional[CatalogActionResult]:
-        disposition = {"type": "equipment", "toolName": tool_name}
-        existing = self.tool_index.resolve(tool_name)
-        action = self._line_action(
-            entry,
-            disposition,
-            "classify_equipment" if existing else "create_tool",
-        )
-        if existing:
-            pending_by_key[entry["key"]] = action.action_id
-            runner.submit_local(action, existing, disposition)
-            return None
-        if not Confirm.ask(
-            f"Create the Mealie tool {tool_name!r}, attach it to matching recipes, "
-            "and keep the original line as a note?",
-            default=False,
-            console=self.console,
-        ):
-            pending_by_key.pop(entry["key"], None)
-            self.console.print("Equipment creation cancelled; nothing was changed.")
-            return None
-        runner.submit(action)
-        return None
 
     def _new_action(
         self,
@@ -1881,7 +1838,9 @@ class CatalogReviewer:
         deferred: set[str],
         errors: dict[str, str],
         checkpoint: QueueCheckpointWriter,
+        summary: Optional[ReviewSummary] = None,
     ) -> int:
+        summary = summary or ReviewSummary()
         action = result.action
         for key in action.reserved_keys:
             if pending_by_key.get(key) == action.action_id:
@@ -1892,17 +1851,13 @@ class CatalogReviewer:
             errors[action.source_key] = result.error
             if action.disposition_raw:
                 errors[line_key(action.disposition_raw)] = result.error
-            self.console.print(
-                f"[error]{escape(action.source_name)!r} failed and returned to review: "
-                f"{escape(result.error)}[/error]"
-            )
             checkpoint.note_completion()
             return 1
 
         if action.kind == "line":
             disposition = result.disposition or action.disposition
             if not disposition:
-                errors[action.source_key] = "Line action returned no disposition"
+                errors[action.source_key] = "This line did not have a saved decision"
                 checkpoint.note_completion()
                 return 1
             if disposition.get("type") == "equipment" and result.item:
@@ -1916,18 +1871,16 @@ class CatalogReviewer:
             deferred.discard(action.source_key)
             self._update_line_entries(entries_by_key, action, disposition)
             checkpoint.note_completion()
-            label = {
-                "note": "Kept as ingredient note",
-                "equipment": f"Added equipment {disposition.get('toolName')!r} and kept as note",
-                "ingredient": "Confirmed as ingredient",
-            }[disposition["type"]]
-            self.console.print(f"[success]{label}: {escape(action.source_name)}[/success]")
+            if disposition["type"] == "note":
+                summary.add("notes", action.source_name)
+            elif disposition["type"] == "ingredient":
+                summary.add("confirmed_ingredients", action.source_name)
             return 0
 
         if not result.item:
-            errors[action.source_key] = "Catalog action returned no item"
+            errors[action.source_key] = "No item was returned after saving this decision"
             if action.disposition_raw:
-                errors[line_key(action.disposition_raw)] = "Catalog action returned no item"
+                errors[line_key(action.disposition_raw)] = errors[action.source_key]
             checkpoint.note_completion()
             return 1
         self.index.upsert(action.kind, result.item)
@@ -1952,21 +1905,27 @@ class CatalogReviewer:
                 deferred.discard(key)
                 errors.pop(key, None)
                 if key != action.source_key:
-                    resolved.append(f"{entry['name']!r} → {item['name']!r}")
-        operation_label = {
-            "create": "Created/resolved",
-            "map_alias": "Mapped and saved alias",
-            "map_once": "Mapped for this queue",
-        }.get(action.operation, "Resolved")
-        self.console.print(
-            f"[success]{operation_label}: {escape(action.source_name)} → "
-            f"{escape(result.item['name'])}[/success]"
-        )
-        if resolved:
-            self.console.print(
-                f"Also resolved {len(resolved)} queued item(s): " + ", ".join(resolved),
-                markup=False,
+                    resolved.append(f"{entry['name']} → {item['name']}")
+        if action.operation == "create":
+            if result.created:
+                summary.add(
+                    "created_ingredients" if action.kind == "food" else "created_units",
+                    result.item["name"],
+                )
+            else:
+                summary.add(
+                    "automatically_matched",
+                    f"{action.source_name} → {result.item['name']}",
+                )
+        elif action.operation == "map_alias":
+            summary.add(
+                "mapped_with_alias",
+                f"{action.source_name} → {result.item['name']}",
             )
+        elif action.operation == "map_once":
+            summary.add("mapped_once", f"{action.source_name} → {result.item['name']}")
+        for resolved_name in resolved:
+            summary.add("automatically_matched", resolved_name)
         if action.disposition and action.disposition_raw:
             self.queue.set_line_disposition(
                 action.disposition_raw,
@@ -1976,77 +1935,9 @@ class CatalogReviewer:
             errors.pop(line_key(action.disposition_raw), None)
             deferred.discard(line_key(action.disposition_raw))
             self._rebuild_entries(entries_by_key)
+            if action.disposition.get("type") == "ingredient":
+                summary.add("confirmed_ingredients", action.disposition_raw)
         checkpoint.note_completion()
-        return 0
-
-    def _queue_bulk(
-        self,
-        entries_by_key: dict[str, dict[str, Any]],
-        deferred: set[str],
-        pending_by_key: dict[str, str],
-        errors: dict[str, str],
-        runner: CatalogActionRunner,
-        checkpoint: QueueCheckpointWriter,
-    ) -> int:
-        entries = [
-            entry
-            for key, entry in entries_by_key.items()
-            if key not in deferred and key not in pending_by_key
-        ]
-        if not entries:
-            self.console.print("No unreviewed proposals remain in this session.")
-            return 0
-        self._bulk_table(entries)
-        eligible = [
-            entry for entry in entries if entry.get("name") and not entry.get("ambiguous")
-        ]
-        initially_excluded = [entry for entry in entries if entry not in eligible]
-        if not eligible:
-            self.console.print(
-                "[warning]No proposals are eligible for bulk creation; review them individually.[/warning]"
-            )
-            return 0
-        if not Confirm.ask(
-            f"Accept and create {len(eligible)} eligible proposed item(s)? "
-            f"{len(initially_excluded)} item(s) will be excluded. Similar existing items may cause duplicates.",
-            default=False,
-            console=self.console,
-        ):
-            self.console.print("Bulk creation cancelled; no proposed items were changed.")
-            return 0
-
-        queued = 0
-        resolved_immediately = 0
-        for entry in eligible:
-            if entry["key"] in pending_by_key:
-                continue
-            try:
-                local_result = self._start_create(
-                    entry,
-                    copy.deepcopy(entry["proposal"]),
-                    entries_by_key,
-                    pending_by_key,
-                    runner,
-                )
-                if local_result:
-                    self._apply_action_result(
-                        local_result,
-                        entries_by_key,
-                        pending_by_key,
-                        deferred,
-                        errors,
-                        checkpoint,
-                    )
-                    resolved_immediately += 1
-                else:
-                    queued += 1
-            except Exception as exc:
-                errors[entry["key"]] = str(exc)
-        self.console.print(
-            f"Queued {queued} catalog action(s); {resolved_immediately} resolved immediately; "
-            f"{len(initially_excluded)} excluded for manual review.",
-            markup=False,
-        )
         return 0
 
     def _edit_proposal(self, entry: dict[str, Any]) -> dict[str, Any]:
@@ -2057,25 +1948,83 @@ class CatalogReviewer:
         ) or None
         if entry["kind"] == "unit":
             proposal["abbreviation"] = Prompt.ask(
-                "Abbreviation", default=proposal.get("abbreviation") or "", console=self.console
+                "Short form", default=proposal.get("abbreviation") or "", console=self.console
             )
             proposal["pluralAbbreviation"] = Prompt.ask(
-                "Plural abbreviation",
+                "Plural short form",
                 default=proposal.get("pluralAbbreviation") or "",
                 console=self.console,
             ) or None
         return proposal
+
+    def _show_summary(
+        self,
+        summary: ReviewSummary,
+        entries_by_key: dict[str, dict[str, Any]],
+        errors: dict[str, str],
+    ) -> None:
+        self.console.rule("[bold cyan]Review summary[/bold cyan]")
+        sections = (
+            ("Created ingredients", summary.created_ingredients),
+            ("Created units", summary.created_units),
+            ("Remembered names", summary.mapped_with_alias),
+            ("Used existing items once", summary.mapped_once),
+            ("Kept as notes", summary.notes),
+            ("Confirmed as ingredients", summary.confirmed_ingredients),
+            ("Deferred until later", summary.deferred),
+            ("Automatically matched", summary.automatically_matched),
+        )
+        shown = False
+        for label, values in sections:
+            if not values:
+                continue
+            shown = True
+            self.console.print(f"{label} ({len(values)}):", style="bold")
+            for value in values:
+                self.console.print(f"  • {value}", markup=False)
+
+        failures: list[str] = []
+        seen_failures: set[str] = set()
+        visible_failure_messages = {
+            message for key, message in errors.items() if key in entries_by_key
+        }
+        for key, message in errors.items():
+            entry = entries_by_key.get(key)
+            if entry is None and message in visible_failure_messages:
+                continue
+            name = str(entry.get("name") if entry else key.split(":", 1)[-1])
+            value = f"{name}: {message}"
+            if value not in seen_failures:
+                seen_failures.add(value)
+                failures.append(value)
+        for value in summary.failures:
+            if value not in seen_failures:
+                seen_failures.add(value)
+                failures.append(value)
+        if failures:
+            shown = True
+            self.console.print(f"Could not save ({len(failures)}):", style="bold red")
+            for value in failures:
+                self.console.print(f"  • {value}", markup=False)
+
+        remaining = len(entries_by_key)
+        if remaining:
+            shown = True
+            self.console.print(
+                f"{remaining} item(s) remain queued for a future review.", markup=False
+            )
+        if not shown:
+            self.console.print("No review decisions were made.", markup=False)
 
     def review(self) -> int:
         list_tools = getattr(self.api, "list_tools", None)
         if callable(list_tools):
             try:
                 self.tool_index.replace(list_tools())
-            except Exception as exc:
-                self.console.print(
-                    f"[warning]Could not load Mealie tools; equipment choices may need retrying: "
-                    f"{escape(str(exc))}[/warning]"
-                )
+            except Exception:
+                # Existing saved equipment decisions are still replayed when possible;
+                # the review itself no longer asks users to manage equipment.
+                pass
         journal = CatalogActionJournal(
             self.queue.path, int(self.queue.data.get("checkpointSequence", 0))
         )
@@ -2087,19 +2036,37 @@ class CatalogReviewer:
             )
         initial_entries = self.queue.entries(self.index)
         if not initial_entries:
-            self.console.print("[success]No unresolved catalog items.[/success]")
+            self.console.print("[success]Nothing needs ingredient, unit, or note review.[/success]")
             return 0
         entries_by_key = {entry["key"]: entry for entry in initial_entries}
+        group_counts = {
+            group: sum(1 for entry in initial_entries if self._entry_group(entry) == group)
+            for group in REVIEW_GROUPS
+        }
+        self.console.print(
+            "Review groups: "
+            + " | ".join(
+                f"{REVIEW_GROUP_LABELS[group]} {group_counts[group]}"
+                for group in REVIEW_GROUPS
+            ),
+            markup=False,
+        )
         deferred: set[str] = set()
         pending_by_key: dict[str, str] = {}
         errors = {
             key: value for key, value in recovery_errors.items() if key in entries_by_key
         }
         failures = 0
+        summary = ReviewSummary()
         runner = CatalogActionRunner(self.api, journal)
         checkpoint = QueueCheckpointWriter(self.queue, journal)
         prefetcher = CatalogSuggestionPrefetcher(self.index)
-        quitting = False
+        completed_groups: set[str] = set()
+        pass_number = 1
+        group_totals = {
+            group: sum(1 for entry in initial_entries if self._entry_group(entry) == group)
+            for group in REVIEW_GROUPS
+        }
 
         def apply_results(results: list[CatalogActionResult]) -> None:
             nonlocal failures
@@ -2111,6 +2078,7 @@ class CatalogReviewer:
                     deferred,
                     errors,
                     checkpoint,
+                    summary,
                 )
 
         try:
@@ -2118,41 +2086,72 @@ class CatalogReviewer:
                 apply_results(runner.drain())
                 for checkpoint_error in checkpoint.errors():
                     failures += 1
-                    self.console.print(
-                        f"[error]Catalog queue checkpoint failed: "
-                        f"{escape(str(checkpoint_error))}[/error]"
-                    )
+                    summary.add("failures", f"Queue checkpoint: {checkpoint_error}")
                 active = [
                     entry
                     for key, entry in entries_by_key.items()
                     if key not in deferred and key not in pending_by_key
                 ]
-                active.sort(
-                    key=lambda item: (
-                        0 if item["kind"] == "line" else 1,
-                        item["kind"],
-                        normalize_name(item["name"]),
+                active = self._sort_entries(active)
+
+                selected_group: Optional[str] = None
+                waiting_for_group = False
+                for group in REVIEW_GROUPS:
+                    if group in completed_groups:
+                        continue
+                    group_active = [
+                        entry for entry in active if self._entry_group(entry) == group
+                    ]
+                    if group_active:
+                        selected_group = group
+                        break
+                    group_pending = any(
+                        self._entry_group(entry) == group
+                        and entry["key"] in pending_by_key
+                        for entry in entries_by_key.values()
                     )
-                )
-                if not active:
-                    if runner.pending_count:
+                    if group_pending:
+                        waiting_for_group = True
+                        break
+                    completed_groups.add(group)
+
+                if selected_group is None:
+                    if waiting_for_group or runner.pending_count:
                         result = runner.wait_for_result(timeout=0.1)
                         if result:
                             apply_results([result])
+                        continue
+                    if active:
+                        # A later decision can reveal a new ingredient/unit after
+                        # that group was already completed. Keep categories contiguous
+                        # and announce the new pass instead of interleaving it.
+                        completed_groups.clear()
+                        pass_number += 1
+                        self.console.print(
+                            f"Additional items were found; starting review pass {pass_number}.",
+                            markup=False,
+                        )
                         continue
                     late_results = runner.drain()
                     if late_results:
                         apply_results(late_results)
                         continue
-                    if entries_by_key:
-                        self.console.print(
-                            f"Review complete for this session; "
-                            f"{len(entries_by_key)} skipped or failed item(s) remain queued.",
-                            markup=False,
-                        )
                     break
 
-                entry = active[0]
+                group_entries = [
+                    entry for entry in active if self._entry_group(entry) == selected_group
+                ]
+                entry = group_entries[0]
+                group_total = sum(
+                    1
+                    for value in entries_by_key.values()
+                    if self._entry_group(value) == selected_group
+                )
+                group_totals[selected_group] = max(
+                    group_totals[selected_group], group_total
+                )
+                group_total = group_totals[selected_group]
+                group_position = group_total - len(group_entries) + 1
                 prefetcher.prefetch(
                     [item for item in active[1:21] if item["kind"] in CATALOG_KINDS]
                 )
@@ -2162,156 +2161,67 @@ class CatalogReviewer:
                     len(deferred),
                     runner.pending_count,
                     errors.get(entry["key"]),
+                    group_position=group_position,
+                    group_total=group_total,
                 )
+                review_entry = entry
                 if entry["kind"] == "line":
                     self._show_line_actions(entry)
+                    catalog_entries = entry.get("catalogEntries") or []
+                    line_choices = ["5", "6", "7", "0"]
+                    if catalog_entries:
+                        line_choices = ["1", "2", "3", "4", *line_choices]
                     action_choice = Prompt.ask(
                         "Choose an action",
-                        choices=[str(value) for value in range(1, 11)],
-                        default="8",
+                        choices=line_choices,
+                        default="7",
                         console=self.console,
                     )
                 else:
                     self._show_actions()
                     action_choice = Prompt.ask(
                         "Choose an action",
-                        choices=["1", "2", "3", "4", "5", "6", "7"],
-                        default="5",
+                        choices=["1", "2", "3", "4", "7", "0"],
+                        default="7",
                         console=self.console,
                     )
                 catalog_disposition: Optional[dict[str, Any]] = None
                 catalog_disposition_raw: Optional[str] = None
                 try:
-                    if entry["kind"] == "line":
-                        recommendation = entry.get("recommendation", "note")
-                        if action_choice == "10":
-                            quitting = True
-                            break
-                        if recommendation == "ingredient":
-                            if action_choice == "7":
-                                deferred.add(entry["key"])
-                                continue
-                            if action_choice == "8":
-                                failures += self._queue_bulk(
-                                    entries_by_key,
-                                    deferred,
-                                    pending_by_key,
-                                    errors,
-                                    runner,
-                                    checkpoint,
-                                )
-                                continue
-                            if action_choice == "9":
-                                self._complete_line_locally(
-                                    entry, {"type": "ingredient"}, runner, pending_by_key
-                                )
-                                continue
-                            if action_choice == "5":
-                                self._complete_line_locally(
-                                    entry, {"type": "note"}, runner, pending_by_key
-                                )
-                                continue
-                            if action_choice == "6":
-                                matches = entry.get("toolMatches") or []
-                                tool_name = (
-                                    matches[0]
-                                    if len(matches) == 1
-                                    else self._choose_tool_name(entry)
-                                )
-                                if tool_name:
-                                    result = self._start_equipment_action(
-                                        entry, tool_name, pending_by_key, runner
-                                    )
-                                    if result:
-                                        apply_results([result])
-                                continue
-                            if action_choice not in ("1", "2", "3", "4"):
-                                continue
-                            catalog_entries = entry.get("catalogEntries") or []
-                            if not catalog_entries:
-                                self.console.print(
-                                    "[warning]The parser did not leave a missing catalog proposal for this line. "
-                                    "Choose 9 to confirm it as an ingredient.[/warning]"
-                                )
-                                continue
-                            raw_line = entry["raw"]
-                            occurrences = copy.deepcopy(entry.get("occurrences") or [])
-                            entry = copy.deepcopy(catalog_entries[0])
-                            entry["occurrences"] = occurrences
-                            catalog_disposition = {"type": "ingredient"}
-                            catalog_disposition_raw = raw_line
-                        else:
-                            if action_choice == "8":
-                                deferred.add(entry["key"])
-                                continue
-                            if action_choice == "9":
-                                failures += self._queue_bulk(
-                                    entries_by_key,
-                                    deferred,
-                                    pending_by_key,
-                                    errors,
-                                    runner,
-                                    checkpoint,
-                                )
-                                continue
-                            if action_choice == "1":
-                                if recommendation == "equipment":
-                                    matches = entry.get("toolMatches") or []
-                                    tool_name = (
-                                        matches[0]
-                                        if len(matches) == 1
-                                        else self._choose_tool_name(entry)
-                                    )
-                                    if tool_name:
-                                        result = self._start_equipment_action(
-                                            entry, tool_name, pending_by_key, runner
-                                        )
-                                        if result:
-                                            apply_results([result])
-                                else:
-                                    self._complete_line_locally(
-                                        entry, {"type": "note"}, runner, pending_by_key
-                                    )
-                                continue
-                            if action_choice == "2":
-                                if recommendation == "equipment":
-                                    self._complete_line_locally(
-                                        entry, {"type": "note"}, runner, pending_by_key
-                                    )
-                                else:
-                                    tool_name = self._choose_tool_name(entry)
-                                    if tool_name:
-                                        result = self._start_equipment_action(
-                                            entry, tool_name, pending_by_key, runner
-                                        )
-                                        if result:
-                                            apply_results([result])
-                                continue
-                            if action_choice == "7":
-                                self._complete_line_locally(
-                                    entry, {"type": "ingredient"}, runner, pending_by_key
-                                )
-                                continue
-                            catalog_entries = entry.get("catalogEntries") or []
-                            if not catalog_entries:
-                                self.console.print(
-                                    "[warning]The parser did not leave a missing catalog proposal for this line. "
-                                    "Choose 7 to confirm it as an ingredient.[/warning]"
-                                )
-                                continue
-                            raw_line = entry["raw"]
-                            occurrences = copy.deepcopy(entry.get("occurrences") or [])
-                            entry = copy.deepcopy(catalog_entries[0])
-                            entry["occurrences"] = occurrences
-                            catalog_disposition = {"type": "ingredient"}
-                            catalog_disposition_raw = raw_line
-                            action_choice = str(int(action_choice) - 2)
-                    if action_choice == "7":
-                        quitting = True
+                    if action_choice == "0":
                         break
-                    if action_choice == "5":
+                    if action_choice == "7":
                         deferred.add(entry["key"])
+                        summary.add("deferred", entry["name"])
                         continue
+                    if entry["kind"] == "line":
+                        if action_choice == "5":
+                            self._complete_line_locally(
+                                entry, {"type": "ingredient"}, runner, pending_by_key
+                            )
+                            continue
+                        if action_choice == "6":
+                            self._complete_line_locally(
+                                entry, {"type": "note"}, runner, pending_by_key
+                            )
+                            continue
+                        if action_choice not in ("1", "2", "3", "4"):
+                            continue
+                        catalog_entries = entry.get("catalogEntries") or []
+                        if not catalog_entries:
+                            self.console.print(
+                                "No suggested ingredient or unit is available for this line. "
+                                "Choose 5 to treat it as an ingredient or 6 to keep it as a note.",
+                                markup=False,
+                            )
+                            continue
+                        raw_line = entry["raw"]
+                        occurrences = copy.deepcopy(entry.get("occurrences") or [])
+                        entry = copy.deepcopy(catalog_entries[0])
+                        entry["occurrences"] = occurrences
+                        catalog_disposition = {"type": "ingredient"}
+                        catalog_disposition_raw = raw_line
+
                     if action_choice in ("1", "2"):
                         proposal = (
                             self._edit_proposal(entry)
@@ -2335,14 +2245,14 @@ class CatalogReviewer:
                         if not selected:
                             continue
                         if action_choice == "3" and not Confirm.ask(
-                            f"Map {escape(repr(entry['name']))} to "
-                            f"{escape(repr(selected['name']))} "
-                            "and save the proposed name as an alias?",
+                            f"Remember {entry['name']!r} as another name for "
+                            f"{selected['name']!r}?",
                             default=False,
                             console=self.console,
                         ):
                             self.console.print(
-                                "Alias mapping cancelled; no catalog item was changed."
+                                "No mapping was saved.",
+                                markup=False,
                             )
                             continue
                         operation = "map_alias" if action_choice == "3" else "map_once"
@@ -2365,23 +2275,15 @@ class CatalogReviewer:
                             apply_results(
                                 [runner.complete_local(catalog_action, selected)]
                             )
-                    elif action_choice == "6":
-                        failures += self._queue_bulk(
-                            entries_by_key,
-                            deferred,
-                            pending_by_key,
-                            errors,
-                            runner,
-                            checkpoint,
-                        )
                 except Exception as exc:
                     failures += 1
-                    errors[entry["key"]] = str(exc)
-                    self.console.print(f"[error]Catalog action failed: {escape(str(exc))}[/error]")
+                    errors[review_entry["key"]] = str(exc)
+                    if catalog_disposition_raw:
+                        errors[line_key(catalog_disposition_raw)] = str(exc)
 
             if runner.pending_count:
                 self.console.print(
-                    f"Finishing {runner.pending_count} submitted catalog action(s) before exit...",
+                    f"Saving {runner.pending_count} item(s) before finishing...",
                     markup=False,
                 )
             while runner.pending_count:
@@ -2389,11 +2291,7 @@ class CatalogReviewer:
                 if result:
                     apply_results([result])
             apply_results(runner.drain())
-            if quitting and errors:
-                self.console.print(
-                    f"{len(errors)} failed or uncertain item(s) remain queued for the next review.",
-                    markup=False,
-                )
+            self._show_summary(summary, entries_by_key, errors)
         finally:
             runner.shutdown()
             prefetcher.shutdown()
@@ -2403,14 +2301,11 @@ class CatalogReviewer:
 
 def pending_summary(console: Console, queue: PendingCatalogQueue, index: CatalogIndex) -> None:
     entries = queue.entries(index)
-    table = Table(title="Pending catalog review")
-    table.add_column("Type")
-    table.add_column("Proposed name")
-    table.add_column("Occurrences", justify="right")
-    table.add_column("Examples")
+    counts = {group: 0 for group in REVIEW_GROUPS}
     for entry in entries:
-        examples = ", ".join(item["slug"] for item in entry["occurrences"][:2])
-        if len(entry["occurrences"]) > 2:
-            examples += f", …and {len(entry['occurrences']) - 2} more"
-        table.add_row(entry["kind"], entry["name"] or "<missing name>", str(len(entry["occurrences"])), examples)
-    console.print(table)
+        counts[review_group(entry)] += 1
+    console.print("Pending review:", markup=False)
+    for group in REVIEW_GROUPS:
+        console.print(
+            f"  {REVIEW_GROUP_LABELS[group]}: {counts[group]}", markup=False
+        )

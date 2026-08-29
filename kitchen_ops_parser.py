@@ -575,17 +575,33 @@ def review_pending_catalog(
         return 0
 
     recipe_count = len(queue.recipes)
-    missing_count = sum(
-        len(record.get("missing", [])) for record in queue.recipes.values()
+    ingredient_count = sum(
+        sum(1 for missing in record.get("missing", []) if missing.get("kind") == "food")
+        + sum(
+            1
+            for review in record.get("lineReviews", [])
+            if review.get("recommendation") == "ingredient"
+        )
+        for record in queue.recipes.values()
     )
-    line_review_count = sum(
-        len(record.get("lineReviews", [])) for record in queue.recipes.values()
+    unit_count = sum(
+        sum(1 for missing in record.get("missing", []) if missing.get("kind") == "unit")
+        for record in queue.recipes.values()
+    )
+    note_count = sum(
+        sum(
+            1
+            for review in record.get("lineReviews", [])
+            if review.get("recommendation") != "ingredient"
+        )
+        for record in queue.recipes.values()
     )
     console.print(
-        "Catalog review pending: "
-        f"[yellow]{recipe_count} recipes[/yellow], "
-        f"[yellow]{missing_count} catalog references[/yellow], "
-        f"[yellow]{line_review_count} flagged lines[/yellow]."
+        "Review pending: "
+        f"[yellow]{ingredient_count} ingredients[/yellow], "
+        f"[yellow]{unit_count} units[/yellow], "
+        f"[yellow]{note_count} notes[/yellow] "
+        f"across [yellow]{recipe_count} recipes[/yellow]."
     )
     if DRY_RUN:
         console.print(
@@ -639,7 +655,7 @@ def main() -> int:
     parser.add_argument(
         "--review-catalog",
         action="store_true",
-        help="review queued foods and units, then retry affected recipes",
+        help="review queued ingredients, units, and notes, then retry affected recipes",
     )
     args = parser.parse_args()
 

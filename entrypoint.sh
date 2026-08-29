@@ -44,7 +44,7 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  idle            Keep the container running without launching a job"
     echo "  tagger          Auto-tag recipes by cuisine, protein, etc. (API)"
     echo "  parser          Fix unparsed ingredients via NLP (API)"
-    echo "  catalog-review  Review queued foods, units, and aliases"
+    echo "  catalog-review  Review queued ingredients, units, notes, and aliases"
     echo "  cleaner         Remove junk / broken recipes (API)"
     echo "  all             Run Tagger → Cleaner → Parser in sequence"
     echo ""
@@ -127,7 +127,7 @@ show_menu() {
     echo "       • Speed:    ⚡ Fast (Parallel API)"
     echo ""
     echo "    4) 📚 Catalog Review"
-    echo "       Approve queued foods, units, aliases, and retry blocked recipes."
+    echo "       Approve queued ingredients, units, notes, aliases, and retry blocked recipes."
     echo ""
     echo "    5) 🚀 Run All"
     echo "       Execute the full suite: Tagger → Cleaner → Parser"
@@ -322,7 +322,7 @@ case "$SCRIPT" in
     "parser")  SCRIPT_LABEL="🔧 Batch Parser" ;;
     "cleaner") SCRIPT_LABEL="🧹 Library Cleaner" ;;
     "tagger")  SCRIPT_LABEL="🏷️  Auto-Tagger (API)" ;;
-    "catalog-review") SCRIPT_LABEL="📚 Catalog Review (Foods, Units & Aliases)" ;;
+    "catalog-review") SCRIPT_LABEL="📚 Catalog Review (Ingredients, Units, Notes & Aliases)" ;;
     "all")     SCRIPT_LABEL="🚀 Full Suite (Tagger → Cleaner → Parser)" ;;
 esac
 

@@ -9,7 +9,7 @@ KitchenOps is a production-ready suite of maintenance tools for [Mealie](https:/
 *   **Data-Driven Architecture**: All tagging rules (cuisines, ingredients, tools) and cleaning logic are externalized in **YAML configuration files**. Customize the behavior without touching a line of code.
 *   **Beautiful CLI**: Built with `rich`, featuring real-time progress bars, status spinners, and formatted reports.
 *   **Production Ready**: Includes robust error handling, automated retries, and comprehensive logging.
-*   **Catalog Review**: Safely approve new foods and units, map aliases to existing catalog items, and retry blocked recipes.
+*   **Catalog Review**: Safely approve new ingredients and units, preserve notes, map aliases to existing items, and retry blocked recipes.
 
 ## 🛠️ The Suite
 
@@ -18,7 +18,7 @@ KitchenOps is a production-ready suite of maintenance tools for [Mealie](https:/
 | **🧹 Auto-Cleaner** | `kitchen_ops_cleaner.py` | API | Low | 🚀 Fastest | Removes junk recipes, broken content, and listicles. |
 | **🏷️ Auto-Tagger** | `kitchen_ops_tagger.py` | API | High | ⚡ Fast | Tags recipes by cuisine, protein, cheese, etc. |
 | **🔧 Batch Parser** | `kitchen_ops_parser.py` | API | Low | 🐢 Slow | Fixes unparsed ingredients using Mealie's NLP engine. |
-| **📚 Catalog Review** | `kitchen_ops_parser.py --review-catalog` | API | Low | ⚡ Fast | Reviews queued foods, units, and aliases, then retries blocked recipes. |
+| **📚 Catalog Review** | `kitchen_ops_parser.py --review-catalog` | API | Low | ⚡ Fast | Reviews queued ingredients, units, notes, and aliases, then retries blocked recipes. |
 - **⚡ DB Accelerator:** 
   - Massive speedup for finding unparsed recipes (~20m → <1s)
   - Instant library scanning for Cleaner (~7h → <1s)
@@ -50,7 +50,7 @@ KitchenOps is configured via environment variables (for connection details) and 
 | `SCRIPT_TO_RUN` | `parser` | Choose `tagger`, `parser`, `catalog-review`, `cleaner`, or `all`. |
 | `LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
 | `PARSER_WORKERS` | `2` | Number of concurrent parsing threads. |
-| `PARSER_REVIEW_FILE` | `logs/parser_pending_catalog.json` | Persistent queue for recipes waiting on foods, units, or aliases. |
+| `PARSER_REVIEW_FILE` | `logs/parser_pending_catalog.json` | Persistent queue for recipes waiting on ingredients, units, notes, or aliases. |
 | `PARSER_HISTORY_FILE` | `/app/state/parse_history.json` | Persistent record of recipes completed by the parser. |
 | `CLEANER_WORKERS` | `2` | Number of concurrent integrity-check threads. |
 | `TAGGER_BULK_BATCH_SIZE` | `500` | Maximum recipes per bulk tag/category assignment request. |
@@ -165,31 +165,30 @@ Parser completion history is stored in `/app/state/parse_history.json` by defaul
 
 KitchenOps also restores leaked ingredient-parser fraction placeholders such as `#3$4` back to `3/4` before displaying or saving a proposal.
 
-On an interactive live run, KitchenOps first shows compact queue counts and asks whether to start review. Declining exits immediately without building the full review index. During review, each entry shows the exact food or unit fields that would be submitted, the total recipe-ingredient usage count, up to two recipe usage examples, and the closest existing catalog matches. Choose from the numbered actions:
+On an interactive live run, KitchenOps first shows compact queue counts and asks whether to start review. Declining exits immediately without building the full review index. During review, entries are grouped in this order: Ingredients, Units, then Notes. Each entry shows the suggested fields, how many recipes use the text, up to two recipe examples, and possible existing matches. Choose from the same action numbers wherever they apply:
 
-1. Create the proposed item.
-2. Edit its details, then create it.
-3. Map it to an existing item and permanently save the proposed name as an alias.
-4. Map it to an existing item for this review queue only.
-5. Skip it until a future review session.
-6. Review all eligible proposals and optionally accept them as a batch.
-7. Quit.
+1. Create the suggested item.
+2. Change details, then create.
+3. Use an existing item and remember this name.
+4. Use an existing item this time only.
+5. Treat this line as an ingredient.
+6. Keep this line as a note.
+7. Defer until later.
+0. Finish review.
 
-KitchenOps also conservatively flags ingredient lines that look like prose or mention configured equipment. A standalone line such as `Air Fryer. I use the Breville Smart Oven Air` is presented as likely equipment instead of being offered directly as a food. A measured ingredient line such as `1 cup chopped carrots ... if you do not have a high-power blender` remains ingredient-first, with the equipment mention shown as advisory information.
+KitchenOps still detects prose and equipment-related wording internally so existing queue and recipe replay behavior remains compatible, but equipment is not a review category and no equipment choices are shown. A measured line that includes extra instructions is presented as an ingredient-versus-note decision. Existing saved equipment decisions continue to be honored when queued recipes are replayed.
 
-Flagged lines use a context-first menu. Mixed ingredient lines show the normal create and mapping choices first; keeping the entire line as a note or classifying it as equipment is explicit and secondary. Equipment-only lines retain the equipment-oriented menu. Equipment matching uses the same `tools_matches` configuration as the tagger. If the selected Mealie tool is missing, KitchenOps shows its exact name and requires a default-No confirmation before creating it.
-
-Choosing Note preserves the original text exactly as a note-only ingredient row. Choosing Equipment does the same and merges the selected tool into the recipe without removing existing tools. Choosing Ingredient suppresses future classification warnings and resumes normal food/unit resolution. These decisions apply only to occurrences with identical normalized original text; differently worded lines remain independent.
+Choosing Note preserves the original text exactly as a note-only ingredient row. Choosing Ingredient suppresses future classification warnings and resumes normal food/unit resolution. Existing saved equipment decisions are still applied during recipe replay, but new review sessions do not create or change equipment decisions. These decisions apply only to occurrences with identical normalized original text; differently worded lines remain independent.
 
 Create and alias actions run in submission order on a background worker, so the next review item appears immediately instead of waiting for a full Mealie catalog refresh. The status line shows how many actions are pending. Names, plurals, aliases, and unit abbreviations affected by a pending creation are temporarily reserved so they are not reviewed twice.
 
-Completed actions update the in-memory catalog directly and report any related proposals that were resolved automatically. A failed action and its related reservations return to the review list with the error visible. KitchenOps records submitted and completed decisions in `logs/parser_pending_catalog.json.journal` and checkpoints the main queue in the background, preserving decisions if the process is interrupted.
+Completed actions update the in-memory catalog directly. Successful background actions are summarized at the end of the session so another item is never shown alongside a completion message for an unrelated item. A failed action and its related reservations return to the review list with the error visible. KitchenOps records submitted and completed decisions in `logs/parser_pending_catalog.json.journal` and checkpoints the main queue in the background, preserving decisions if the process is interrupted.
 
 Explicit Note, Equipment, and Ingredient decisions are retained in the version-1 queue's `lineDispositions` registry. Future parser runs consult that registry before sending matching lines to Mealie's ingredient parser, preventing a decided note or equipment line from returning as a proposed food. Existing queue files are upgraded in memory with optional line-review fields and require no migration.
 
-Choosing Quit stops new decisions but waits for submitted catalog actions to finish and saves a final queue checkpoint before recipe updates begin.
+Choosing Finish review stops new decisions but waits for submitted catalog actions to finish and saves a final queue checkpoint before recipe updates begin.
 
-The batch review displays every unreviewed proposal before asking for confirmation. Ambiguous items are clearly marked and excluded for individual review, confirmation defaults to No, and a failure on one item does not prevent the remaining eligible items from being processed. The final summary lists created, reused, automatically resolved, excluded, and failed items.
+At the end of review, KitchenOps prints a grouped summary of created ingredients and units, remembered names, one-time mappings, notes, confirmed ingredients, deferred items, automatic matches, and failures. There is no bulk terminal grid or CSV import workflow.
 
 To resume the review later:
 
