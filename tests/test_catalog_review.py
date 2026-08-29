@@ -13,6 +13,7 @@ import kitchen_ops_parser as parser
 from kitchen_ops_catalog import (
     CatalogApi,
     CatalogActionJournal,
+    CatalogActionRunner,
     CatalogIndex,
     CatalogReviewer,
     PendingCatalogQueue,
@@ -157,7 +158,9 @@ class LineDetectionTests(unittest.TestCase):
             classify_review_line("I prefer to make this a day ahead.")["recommendation"],
             "note",
         )
-        self.assertIsNone(classify_review_line("1 skillet steak"))
+        self.assertEqual(
+            classify_review_line("1 skillet steak")["recommendation"], "ingredient"
+        )
         self.assertIsNone(classify_review_line("skillet steak"))
         self.assertIsNone(classify_review_line("parsley for serving"))
         self.assertIsNone(classify_review_line("salt and pepper, to taste."))
@@ -171,6 +174,15 @@ class LineDetectionTests(unittest.TestCase):
 
         self.assertEqual(result["recommendation"], "equipment")
         self.assertEqual(set(result["toolMatches"]), {"Wok", "Smoker / Grill"})
+
+    def test_equipment_mention_in_measured_ingredient_is_advisory(self):
+        result = classify_review_line(
+            "1 cup chopped carrots (steamed and cooled if you do not have a slow cooker)"
+        )
+
+        self.assertEqual(result["recommendation"], "ingredient")
+        self.assertEqual(result["toolMatches"], ["Slow Cooker"])
+        self.assertIn("ingredient line", result["reasons"][0])
 
 
 class CatalogIndexTests(unittest.TestCase):
@@ -266,6 +278,37 @@ class QueueAndReviewTests(unittest.TestCase):
         self.assertEqual(entries[0]["kind"], "line")
         self.assertEqual(entries[0]["recommendation"], "equipment")
         self.assertEqual(entries[0]["catalogEntries"][0]["kind"], "food")
+
+    def test_mixed_ingredient_line_uses_ingredient_first_menu(self):
+        raw = (
+            "1 cup chopped carrots (steamed and cooled if you do not have a slow cooker)"
+        )
+        self.queue.upsert_recipe(flagged_record(raw=raw, food="chopped carrots"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+        entry = self.queue.entries(self.index)[0]
+
+        reviewer._show_entry(entry, 1, 0)
+        reviewer._show_line_actions(entry)
+        self.console.file.flush()
+        output = self.console_path.read_text()
+
+        self.assertEqual(entry["recommendation"], "ingredient")
+        self.assertIn("Ingredient line mentions equipment: Slow Cooker", output)
+        self.assertIn("1) Create the proposed catalog item", output)
+        self.assertIn("6) Classify this line as equipment", output)
+        self.assertNotIn("Add 'Blender' as equipment", output)
+
+    def test_mixed_ingredient_line_can_be_confirmed_without_equipment(self):
+        raw = (
+            "1 cup chopped carrots (steamed and cooled if you do not have a slow cooker)"
+        )
+        self.queue.upsert_recipe(flagged_record(raw=raw, food="chopped carrots"))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=["9", "7"]):
+            reviewer.review()
+
+        self.assertEqual(self.queue.line_disposition(raw)["type"], "ingredient")
 
     def test_note_disposition_applies_to_identical_raw_text_only(self):
         self.queue.upsert_recipe(flagged_record("one"))
@@ -623,6 +666,43 @@ class QueueAndReviewTests(unittest.TestCase):
         self.assertEqual(len(action_times), 2)
         self.assertLess(action_times[1] - action_times[0], 0.15)
         self.assertEqual([item[1]["name"] for item in self.api.created], ["alpha food"])
+
+    def test_review_advances_while_note_completion_is_still_running(self):
+        raw_one = "I prefer to make this a day ahead."
+        raw_two = "Let rest before slicing."
+        self.queue.upsert_recipe(flagged_record("one", raw=raw_one, food=raw_one))
+        self.queue.upsert_recipe(flagged_record("two", raw=raw_two, food=raw_two))
+        reviewer = CatalogReviewer(self.queue, self.index, self.api, self.console)
+        action_started = threading.Event()
+        release_action = threading.Event()
+        action_times = []
+        real_run = CatalogActionRunner._run
+
+        def delayed_run(runner, action):
+            action_started.set()
+            release_action.wait(timeout=2)
+            return real_run(runner, action)
+
+        def prompt(question, **kwargs):
+            if question != "Choose an action":
+                raise AssertionError(f"Unexpected prompt: {question}")
+            action_times.append(time.perf_counter())
+            if len(action_times) == 1:
+                return "1"
+            self.assertTrue(action_started.wait(timeout=1))
+            release_action.set()
+            return "10"
+
+        with patch("kitchen_ops_catalog.Prompt.ask", side_effect=prompt), patch.object(
+            CatalogActionRunner, "_run", new=delayed_run
+        ):
+            reviewer.review()
+
+        self.assertEqual(len(action_times), 2)
+        self.assertLess(action_times[1] - action_times[0], 0.15)
+        self.assertEqual(self.queue.line_disposition(raw_one)["type"], "note")
+        self.assertIsNone(self.queue.line_disposition(raw_two))
+        self.assertEqual(self.api.created, [])
 
     def test_background_catalog_writes_are_serial(self):
         for slug, food in (("one", "alpha food"), ("two", "beta food"), ("three", "gamma food")):

@@ -47,6 +47,7 @@ case "$1" in
     *) exit 2 ;;
 esac
 echo "$job" >> "$KITCHEN_OPS_TEST_LOG"
+exit "${KITCHEN_OPS_TEST_EXIT_STATUS:-0}"
 """
         )
         fake_python.chmod(0o755)
@@ -176,6 +177,16 @@ echo "$job" >> "$KITCHEN_OPS_TEST_LOG"
         finally:
             process.terminate()
             process.communicate(timeout=5)
+
+    def test_parser_interrupt_status_is_propagated(self):
+        env = self.env.copy()
+        env["KITCHEN_OPS_TEST_EXIT_STATUS"] = "130"
+
+        result = self.run_entrypoint("parser", env=env)
+
+        self.assertEqual(result.returncode, 130)
+        self.assertIn("State was checkpointed", result.stdout)
+        self.assertNotIn("KitchenOps Complete", result.stdout)
 
 
 if __name__ == "__main__":

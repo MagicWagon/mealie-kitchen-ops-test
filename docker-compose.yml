@@ -8,6 +8,7 @@ services:
       - /docker/appdata/mealie/mealie.db:/app/data/mealie.db:ro
       - /docker/appdata/kitchen-ops/config:/app/config:ro
       - /docker/appdata/kitchen-ops/logs:/app/logs
+      - /docker/appdata/kitchen-ops/state:/app/state
     networks:
       - media_proxy
     restart: "no"

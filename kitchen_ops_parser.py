@@ -1,9 +1,10 @@
 """KitchenOps Batch Parser — fixes unparsed recipe ingredients via Mealie's NLP API."""
 
 import argparse
-import concurrent.futures, copy, json, logging, os, re, signal, sys, threading, time
+import concurrent.futures, copy, json, logging, os, re, signal, sys, tempfile, threading, time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import requests
@@ -22,7 +23,6 @@ from kitchen_ops_catalog import (
     ToolIndex,
     classify_review_line,
     normalize_name,
-    pending_summary,
     replay_ready_recipes,
 )
 
@@ -51,7 +51,8 @@ API_TOKEN: str = os.getenv("MEALIE_API_TOKEN", "")
 MAX_WORKERS: int = int(os.getenv("PARSER_WORKERS", "8"))
 DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() == "true"
 CONFIDENCE_THRESHOLD: float = 0.85
-HISTORY_FILE: str = "parse_history.json"
+HISTORY_FILE: str = os.getenv("PARSER_HISTORY_FILE", "/app/state/parse_history.json")
+LEGACY_HISTORY_FILE: str = "/app/parse_history.json"
 REVIEW_FILE: str = os.getenv("PARSER_REVIEW_FILE", "logs/parser_pending_catalog.json")
 SAVE_INTERVAL: int = 20
 
@@ -73,14 +74,13 @@ thread_local = threading.local()
 
 
 SHUTDOWN_REQUESTED = False
-
 def signal_handler(sig: int, frame: Any) -> None:
     global SHUTDOWN_REQUESTED
     SHUTDOWN_REQUESTED = True
     console.print("\n[warning]Interrupt received. Stopping threads cleanly...[/warning]")
-    save_history()
 
 signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 
 def get_session() -> requests.Session:
@@ -96,24 +96,53 @@ def get_session() -> requests.Session:
     return thread_local.session
 
 
+def _read_history(path: Path) -> set[str]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return set(json.load(handle))
+    except (json.JSONDecodeError, OSError) as exc:
+        console.print(f"[warning]Could not load history file {path}: {exc}[/warning]")
+        return set()
+
+
+def _write_history(history: set[str]) -> None:
+    path = Path(HISTORY_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(sorted(history), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
 def load_history() -> set[str]:
-    if os.path.exists(HISTORY_FILE):
+    path = Path(HISTORY_FILE)
+    if path.exists():
+        return _read_history(path)
+
+    legacy = Path(LEGACY_HISTORY_FILE)
+    if legacy.exists() and legacy != path:
+        history = _read_history(legacy)
         try:
-            with open(HISTORY_FILE, "r") as f:
-                return set(json.load(f))
-        except (json.JSONDecodeError, IOError) as e:
-            console.print(f"[warning]Could not load history file: {e}[/warning]")
-            return set()
+            _write_history(history)
+            console.print(f"[info]Migrated parser history from {legacy} to {path}.[/info]")
+        except OSError as exc:
+            console.print(f"[warning]Could not migrate parser history to {path}: {exc}[/warning]")
+        return history
     return set()
 
 
 def save_history() -> None:
     with HISTORY_LOCK:
         try:
-            with open(HISTORY_FILE, "w") as f:
-                json.dump(list(HISTORY_SET), f)
-        except IOError as e:
-            console.print(f"[error]Could not save history: {e}[/error]")
+            _write_history(HISTORY_SET)
+        except OSError as exc:
+            console.print(f"[error]Could not save history: {exc}[/error]")
 
 
 def connect_db() -> Optional[object]:
@@ -186,6 +215,11 @@ def get_recipes_needing_parsing_db(conn) -> Optional[list[dict]]:
             FROM recipes r
             JOIN recipes_ingredients ri ON r.id = ri.recipe_id
             WHERE ri.food_id IS NULL
+              AND ri.unit_id IS NULL
+              AND (
+                    COALESCE(ri.note, '') <> ''
+                    OR COALESCE(ri.original_text, '') <> ''
+                  )
         """
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -220,6 +254,17 @@ def get_all_recipes() -> list[dict]:
                 console.print(f"[warning]Index fetch failed page {page}: {e}[/warning]")
                 break
     return recipes
+
+
+def select_todo_recipes(
+    candidates: list[dict], history: set[str], queued_slugs: set[str]
+) -> list[dict]:
+    """Return only new parser work; catalog-queued recipes use the replay path."""
+    return [
+        recipe
+        for recipe in candidates
+        if recipe["slug"] not in history and recipe["slug"] not in queued_slugs
+    ]
 
 
 @dataclass
@@ -372,6 +417,9 @@ def process_recipe(slug: str) -> ProcessResult:
     if not to_parse and not disposition_changed:
         return ProcessResult("success", slug)
 
+    if SHUTDOWN_REQUESTED:
+        return ProcessResult("cancelled", slug)
+
     # NLP pass
     if to_parse:
         try:
@@ -402,6 +450,8 @@ def process_recipe(slug: str) -> ProcessResult:
 
             # AI escalation
             if retry_texts:
+                if SHUTDOWN_REQUESTED:
+                    return ProcessResult("cancelled", slug)
                 try:
                     r_ai = session.post(
                         f"{MEALIE_URL}/api/parser/ingredients",
@@ -477,6 +527,9 @@ def process_recipe(slug: str) -> ProcessResult:
     if DRY_RUN:
         return ProcessResult("dry_run", slug)
 
+    if SHUTDOWN_REQUESTED:
+        return ProcessResult("cancelled", slug)
+
     try:
         r_update = session.put(f"{MEALIE_URL}/api/recipes/{slug}", json=full_recipe, timeout=15)
         if 200 <= r_update.status_code < 300:
@@ -497,6 +550,20 @@ def format_elapsed(seconds: float) -> str:
     return f"{s}s"
 
 
+def checkpoint_interrupted_run(queue: PendingCatalogQueue, start_time: float) -> int:
+    """Persist durable parser state and terminate without entering review."""
+    queue.save()
+    logger.info("Final queue checkpoint saved after interrupt")
+    if not DRY_RUN:
+        save_history()
+    elapsed = time.time() - start_time
+    console.rule("[bold yellow]Batch Parse Interrupted[/bold yellow]")
+    console.print("State checkpointed; catalog review was skipped.")
+    console.print(f"⏱️  Elapsed: {format_elapsed(elapsed)}")
+    logger.info("Interrupted before recipe processing completed | Elapsed: %s", format_elapsed(elapsed))
+    return 130
+
+
 def review_pending_catalog(
     api: CatalogApi,
     queue: PendingCatalogQueue,
@@ -507,7 +574,19 @@ def review_pending_catalog(
         console.print("[success]No recipes are waiting on catalog review.[/success]")
         return 0
 
-    pending_summary(console, queue, CATALOG_INDEX)
+    recipe_count = len(queue.recipes)
+    missing_count = sum(
+        len(record.get("missing", [])) for record in queue.recipes.values()
+    )
+    line_review_count = sum(
+        len(record.get("lineReviews", [])) for record in queue.recipes.values()
+    )
+    console.print(
+        "Catalog review pending: "
+        f"[yellow]{recipe_count} recipes[/yellow], "
+        f"[yellow]{missing_count} catalog references[/yellow], "
+        f"[yellow]{line_review_count} flagged lines[/yellow]."
+    )
     if DRY_RUN:
         console.print(
             "[warning]Dry Run is enabled. Catalog decisions and recipe updates are disabled.[/warning]"
@@ -520,7 +599,11 @@ def review_pending_catalog(
             "SCRIPT_TO_RUN=catalog-review.[/warning]"
         )
         return 0
-    if ask_first and not Confirm.ask("Review pending catalog items and flagged lines now?", default=True, console=console):
+    if ask_first and not Confirm.ask(
+        "Review pending catalog items and flagged lines now?",
+        default=True,
+        console=console,
+    ):
         console.print("Review deferred; the queue has been saved.")
         return 0
 
@@ -588,6 +671,52 @@ def main() -> int:
         return review_pending_catalog(api, queue, ask_first=False)
 
     start_time = time.time()
+
+    if queue.recipes:
+        if DRY_RUN:
+            console.print(
+                f"[info]Dry run: leaving {len(queue.recipes)} queued recipes for catalog review.[/info]"
+            )
+            logger.info(
+                "Queue replay skipped in dry run | Waiting: %s", len(queue.recipes)
+            )
+        else:
+            console.print(
+                f"[info]Checking {len(queue.recipes)} queued recipes against the current catalog...[/info]"
+            )
+            logger.info("Queue replay started | Recipes: %s", len(queue.recipes))
+            try:
+                replay_stats = replay_ready_recipes(
+                    queue,
+                    CATALOG_INDEX,
+                    api,
+                    HISTORY_SET,
+                    logger=lambda message: logger.info(message),
+                    tool_index=TOOL_INDEX,
+                    should_stop=lambda: SHUTDOWN_REQUESTED,
+                )
+            except Exception as exc:
+                console.print(f"[error]Queued recipe replay failed: {exc}[/error]")
+                logger.info("Queue replay aborted | Error: %s", exc)
+                return 1
+            save_history()
+            LINE_DISPOSITIONS = copy.deepcopy(queue.data.get("lineDispositions", {}))
+            console.print(
+                "Queue replay: "
+                f"[green]{replay_stats['updated']} updated[/green], "
+                f"[yellow]{replay_stats['waiting']} waiting[/yellow], "
+                f"[yellow]{replay_stats['stale']} stale[/yellow], "
+                f"[red]{replay_stats['failed']} failed[/red]."
+            )
+            logger.info(
+                "Queue replay complete | Updated: %s | Waiting: %s | Stale: %s | Failed: %s",
+                replay_stats["updated"],
+                replay_stats["waiting"],
+                replay_stats["stale"],
+                replay_stats["failed"],
+            )
+            if replay_stats.get("interrupted") or SHUTDOWN_REQUESTED:
+                return checkpoint_interrupted_run(queue, start_time)
     
     # DB Acceleration Strategy
     db_conn = connect_db()
@@ -602,14 +731,26 @@ def main() -> int:
     if candidates is None:
         candidates = get_all_recipes()
 
-    todo = [
-        recipe
-        for recipe in candidates
-        if recipe["slug"] not in HISTORY_SET or recipe["slug"] in queue.recipes
-    ]
+    if SHUTDOWN_REQUESTED:
+        return checkpoint_interrupted_run(queue, start_time)
+
+    queued_slugs = set(queue.recipes)
+    queued_candidates = sum(
+        1 for recipe in candidates if recipe["slug"] in queued_slugs
+    )
+    todo = select_todo_recipes(candidates, HISTORY_SET, queued_slugs)
     
-    console.print(f"[info]Recipes: {len(candidates)} total, {len(HISTORY_SET)} already done, {len(todo)} remaining[/info]")
-    logger.info(f"Recipes: {len(candidates)} total, {len(HISTORY_SET)} done, {len(todo)} remaining")
+    console.print(
+        f"[info]Recipes: {len(candidates)} candidates, {len(HISTORY_SET)} already done, "
+        f"{queued_candidates} queued for review, {len(todo)} remaining[/info]"
+    )
+    logger.info(
+        "Recipes: %s candidates, %s done, %s queued, %s remaining",
+        len(candidates),
+        len(HISTORY_SET),
+        queued_candidates,
+        len(todo),
+    )
 
     if not todo:
         console.print("[success]All recipes parsed! Nothing to do.[/success]")
@@ -621,6 +762,8 @@ def main() -> int:
     dry_run_count = 0
     blocked = 0
     failed = 0
+    cancelled = 0
+    queue_changes_since_checkpoint = 0
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -633,19 +776,43 @@ def main() -> int:
     ) as progress:
         task = progress.add_task(f"Parsing {len(todo)} recipes...", total=len(todo))
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_slug = {executor.submit(process_recipe, r["slug"]): r["slug"] for r in todo}
-            for future in concurrent.futures.as_completed(future_to_slug):
-                if SHUTDOWN_REQUESTED:
-                    for f in future_to_slug:
-                        f.cancel()
-                    break
-                    
-                slug = future_to_slug[future]
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        pending: dict[concurrent.futures.Future[ProcessResult], str] = {}
+        todo_iterator = iter(todo)
+
+        def fill_workers() -> None:
+            while not SHUTDOWN_REQUESTED and len(pending) < MAX_WORKERS:
                 try:
-                    result = future.result()
+                    recipe = next(todo_iterator)
+                except StopIteration:
+                    break
+                future = executor.submit(process_recipe, recipe["slug"])
+                pending[future] = recipe["slug"]
+
+        fill_workers()
+        try:
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    pending,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    slug = pending.pop(future)
+                    try:
+                        result = future.result()
+                    except concurrent.futures.CancelledError:
+                        cancelled += 1
+                        progress.advance(task)
+                        continue
+                    except Exception as exc:
+                        failed += 1
+                        logger.info(f"ERROR: {slug} — {exc}")
+                        progress.advance(task)
+                        continue
+
                     if result.status == "success":
-                        queue.remove_recipe(slug)
+                        if slug in queue.recipes:
+                            queue.remove_recipe(slug)
                         if not DRY_RUN:
                             with HISTORY_LOCK:
                                 HISTORY_SET.add(slug)
@@ -661,20 +828,50 @@ def main() -> int:
                         with HISTORY_LOCK:
                             HISTORY_SET.discard(slug)
                         queue.upsert_recipe(result.blocked_record)
-                        queue.save()
+                        queue_changes_since_checkpoint += 1
+                        if queue_changes_since_checkpoint >= SAVE_INTERVAL:
+                            queue.save()
+                            queue_changes_since_checkpoint = 0
+                            logger.info("Queue checkpoint saved")
                         logger.info(f"BLOCKED: {slug} — pending catalog review")
+                    elif result.status == "cancelled":
+                        cancelled += 1
+                        logger.info(f"CANCELLED: {slug} — shutdown requested")
                     else:
                         failed += 1
                         logger.info(f"FAIL: {slug} — {result.error}")
-                except Exception as e:
-                    failed += 1
-                    logger.info(f"ERROR: {slug} — {e}")
-                progress.advance(task)
+                    progress.advance(task)
+                fill_workers()
+        finally:
+            if SHUTDOWN_REQUESTED:
+                for future in pending:
+                    future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
 
     elapsed = time.time() - start_time
     queue.save()
+    logger.info("Final queue checkpoint saved")
     if not DRY_RUN:
         save_history()
+    if SHUTDOWN_REQUESTED:
+        console.rule("[bold yellow]Batch Parse Interrupted[/bold yellow]")
+        console.print(
+            f"Processed: [green]{count}[/green] | Dry Run: [cyan]{dry_run_count}[/cyan] | "
+            f"Catalog Review: [yellow]{blocked}[/yellow] | Failed: [red]{failed}[/red] | "
+            f"Cancelled: [yellow]{cancelled}[/yellow]"
+        )
+        console.print(f"⏱️  Elapsed: {format_elapsed(elapsed)}")
+        logger.info(
+            "Interrupted | OK: %s | Dry Run: %s | Blocked: %s | Failed: %s | "
+            "Cancelled: %s | Elapsed: %s",
+            count,
+            dry_run_count,
+            blocked,
+            failed,
+            cancelled,
+            format_elapsed(elapsed),
+        )
+        return 130
     console.rule("[bold green]Batch Parse Complete[/bold green]")
     console.print(
         f"Processed: [green]{count}[/green] | Dry Run: [cyan]{dry_run_count}[/cyan] | "

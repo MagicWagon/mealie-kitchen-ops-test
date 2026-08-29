@@ -411,6 +411,7 @@ run_script() {
 # Execute
 START_TIME=$(date +%s)
 run_script
+RUN_STATUS=$?
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
 
@@ -435,6 +436,15 @@ fi
 echo ""
 echo "  ⏱️  Elapsed: $ELAPSED_STR"
 echo ""
+
+if [ "$RUN_STATUS" -ne 0 ]; then
+    if [ "$RUN_STATUS" -eq 130 ]; then
+        echo "  ⛔ Interrupted. State was checkpointed; catalog review was skipped."
+    else
+        echo "  ❌ KitchenOps exited with status $RUN_STATUS."
+    fi
+    exit "$RUN_STATUS"
+fi
 
 # "Run again?" loop — only in interactive mode
 if [ -t 0 ]; then
@@ -467,6 +477,7 @@ if [ -t 0 ]; then
                 
                 START_TIME=$(date +%s)
                 run_script
+                RUN_STATUS=$?
                 END_TIME=$(date +%s)
                 ELAPSED=$((END_TIME - START_TIME))
                 
@@ -489,6 +500,14 @@ if [ -t 0 ]; then
                 echo ""
                 echo "  ⏱️  Elapsed: $ELAPSED_STR"
                 echo ""
+                if [ "$RUN_STATUS" -ne 0 ]; then
+                    if [ "$RUN_STATUS" -eq 130 ]; then
+                        echo "  ⛔ Interrupted. State was checkpointed; catalog review was skipped."
+                    else
+                        echo "  ❌ KitchenOps exited with status $RUN_STATUS."
+                    fi
+                    exit "$RUN_STATUS"
+                fi
                 ;;
             *)
                 break

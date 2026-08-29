@@ -51,6 +51,7 @@ KitchenOps is configured via environment variables (for connection details) and 
 | `LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
 | `PARSER_WORKERS` | `2` | Number of concurrent parsing threads. |
 | `PARSER_REVIEW_FILE` | `logs/parser_pending_catalog.json` | Persistent queue for recipes waiting on foods, units, or aliases. |
+| `PARSER_HISTORY_FILE` | `/app/state/parse_history.json` | Persistent record of recipes completed by the parser. |
 | `CLEANER_WORKERS` | `2` | Number of concurrent integrity-check threads. |
 | `TAGGER_BULK_BATCH_SIZE` | `500` | Maximum recipes per bulk tag/category assignment request. |
 
@@ -116,6 +117,7 @@ docker run -it --rm \
   --env-file .env \
   -v $(pwd)/config:/app/config \
   -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/state:/app/state \
   ghcr.io/d0rk4ce/mealie-kitchen-ops:latest
 
 # 3b. Or choose a specific tool directly:
@@ -123,6 +125,7 @@ docker run -it --rm \
   --env-file .env \
   -v $(pwd)/config:/app/config \
   -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/state:/app/state \
   ghcr.io/d0rk4ce/mealie-kitchen-ops:latest parser
 ```
 
@@ -148,6 +151,7 @@ podman run -it --rm \
   --env-file .env \
   -v $(pwd)/config:/app/config:z \
   -v $(pwd)/logs:/app/logs:z \
+  -v $(pwd)/state:/app/state:z \
   ghcr.io/d0rk4ce/mealie-kitchen-ops:latest
 ```
 
@@ -155,9 +159,13 @@ podman run -it --rm \
 
 The Batch Parser resolves canonical food and unit names, plurals, abbreviations, and existing aliases automatically. If Mealie's parser proposes a catalog item without an ID, KitchenOps leaves that entire recipe unchanged and records the proposal in `logs/parser_pending_catalog.json` instead of sending an invalid update.
 
+At the start of a live parser run, KitchenOps replays queued recipes that have become fully resolvable from the current catalog without sending their ingredients through NLP again. Recipes that still need a catalog decision are skipped until catalog review. Dry runs never replay queued updates. Pressing Ctrl+C checkpoints the queue and history, skips catalog review, and exits with status 130.
+
+Parser completion history is stored in `/app/state/parse_history.json` by default. Existing `/app/parse_history.json` history is migrated automatically and left in place. Mount `/app/state` whenever the container may be replaced.
+
 KitchenOps also restores leaked ingredient-parser fraction placeholders such as `#3$4` back to `3/4` before displaying or saving a proposal.
 
-On an interactive live run, KitchenOps offers to review the queue after parsing. Each entry shows the exact food or unit fields that would be submitted, the total recipe-ingredient usage count, up to two recipe usage examples, and the closest existing catalog matches. Choose from the numbered actions:
+On an interactive live run, KitchenOps first shows compact queue counts and asks whether to start review. Declining exits immediately without building the full review index. During review, each entry shows the exact food or unit fields that would be submitted, the total recipe-ingredient usage count, up to two recipe usage examples, and the closest existing catalog matches. Choose from the numbered actions:
 
 1. Create the proposed item.
 2. Edit its details, then create it.
@@ -167,9 +175,9 @@ On an interactive live run, KitchenOps offers to review the queue after parsing.
 6. Review all eligible proposals and optionally accept them as a batch.
 7. Quit.
 
-KitchenOps also conservatively flags ingredient lines that look like prose or configured equipment. For example, `Air Fryer. I use the Breville Smart Oven Air` is presented as likely equipment instead of being offered directly as a food. Classification is advisory: flagged lines require an explicit choice and cannot be included in bulk food or unit creation.
+KitchenOps also conservatively flags ingredient lines that look like prose or mention configured equipment. A standalone line such as `Air Fryer. I use the Breville Smart Oven Air` is presented as likely equipment instead of being offered directly as a food. A measured ingredient line such as `1 cup chopped carrots ... if you do not have a high-power blender` remains ingredient-first, with the equipment mention shown as advisory information.
 
-Flagged lines use a context-first menu. The recommended Note or Equipment action appears first, followed by the normal create and mapping choices, an option to confirm that the line really is an ingredient, Skip, bulk review, and Quit. Equipment matching uses the same `tools_matches` configuration as the tagger. If the selected Mealie tool is missing, KitchenOps shows its exact name and requires a default-No confirmation before creating it.
+Flagged lines use a context-first menu. Mixed ingredient lines show the normal create and mapping choices first; keeping the entire line as a note or classifying it as equipment is explicit and secondary. Equipment-only lines retain the equipment-oriented menu. Equipment matching uses the same `tools_matches` configuration as the tagger. If the selected Mealie tool is missing, KitchenOps shows its exact name and requires a default-No confirmation before creating it.
 
 Choosing Note preserves the original text exactly as a note-only ingredient row. Choosing Equipment does the same and merges the selected tool into the recipe without removing existing tools. Choosing Ingredient suppresses future classification warnings and resumes normal food/unit resolution. These decisions apply only to occurrences with identical normalized original text; differently worded lines remain independent.
 
@@ -192,6 +200,7 @@ docker run -it --rm \
   -e SCRIPT_TO_RUN=catalog-review \
   -v $(pwd)/config:/app/config \
   -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/state:/app/state \
   ghcr.io/d0rk4ce/mealie-kitchen-ops:latest
 ```
 
